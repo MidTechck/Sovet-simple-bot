@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
@@ -13,13 +13,12 @@ let isConnected = false;
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`Using Baileys version v${version.join('.')}`);
 
     const sock = makeWASocket({
         auth: state,
+        version: [2, 3000, 1033893291],
         logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.0']
+        browser: ['Mac OS', 'Safari', '17.0']
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -27,23 +26,22 @@ async function startBot() {
         
         if (qr) {
             qrCodeData = qr;
-            console.log('📱 New QR code generated successfully.');
+            console.log('New QR code generated successfully.');
         }
 
         if (connection === 'open') {
             isConnected = true;
             qrCodeData = '';
-            console.log('✅ Connected to WhatsApp successfully!');
+            console.log('Connected to WhatsApp successfully!');
         }
         
         if (connection === 'close') {
             isConnected = false;
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log(`Connection closed. Reason:`, lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
+            console.log('Connection closed. Reason:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
             
-            // Clear corrupted session if logged out or conflict occurs
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 440) {
-                console.log('Clearing corrupted auth state...');
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 440) {
+                console.log('Clearing auth state due to error...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
@@ -72,14 +70,14 @@ async function startBot() {
 
 app.get('/', async (req, res) => {
     if (isConnected) {
-        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">✅ Bot is already connected to WhatsApp!</h1>');
+        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is already connected to WhatsApp!</h1>');
     }
     if (!qrCodeData) {
         return res.send(`
             <html>
             <head><meta http-equiv="refresh" content="4"></head>
             <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
-                <h2>⏳ Generating fresh QR code, please wait...</h2>
+                <h2>Generating fresh QR code, please wait...</h2>
                 <p>This page will auto-refresh until the code appears.</p>
             </body>
             </html>
@@ -92,7 +90,7 @@ app.get('/', async (req, res) => {
             <head><meta http-equiv="refresh" content="15"></head>
             <body style="text-align:center; margin-top:8vh; font-family:sans-serif;">
                 <h2>Scan this QR Code to Link WhatsApp Bot</h2>
-                <p>Open WhatsApp -> Linked Devices -> Link a Device</p>
+                <p>Open WhatsApp - Linked Devices - Link a Device</p>
                 <img src="${url}" alt="WhatsApp QR Code" style="width:320px; height:320px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
                 <p style="color:gray; font-size:14px; margin-top:20px;">Page auto-refreshes to keep your QR code active.</p>
             </body>
@@ -104,7 +102,7 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log('Server running on port ' + PORT);
     startBot();
 });
 
