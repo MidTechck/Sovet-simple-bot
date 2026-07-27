@@ -61,20 +61,19 @@ async function startBot() {
     });
 }
 
-// Web page route for your client in Lusaka
 app.get('/', async (req, res) => {
     if (isConnected) {
         return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">✅ Bot is already connected to WhatsApp!</h1>');
     }
     if (!qrCodeData) {
-        return res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif;">⏳ Generating QR code, please refresh the page in 5 seconds...</h1>');
+        return res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif;">⏳ Generating QR code, please refresh this page in 5 seconds...</h1>');
     }
     try {
         const url = await qrcode.toDataURL(qrCodeData);
         res.send(`
             <div style="text-align:center; margin-top:8vh; font-family:sans-serif;">
                 <h2>Scan this QR Code to Link WhatsApp Bot</h2>
-                <p>Tell your client to open WhatsApp -> Linked Devices -> Link a Device</p>
+                <p>Open WhatsApp -> Linked Devices -> Link a Device</p>
                 <img src="${url}" alt="WhatsApp QR Code" style="width:320px; height:320px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
                 <p style="color:gray; font-size:14px; margin-top:20px;">Refresh this page if the code needs to be renewed.</p>
             </div>
