@@ -3,9 +3,10 @@ const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
 const qrcode = require('qrcode');
+const fs = require('fs');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 
 let qrCodeData = '';
 let isConnected = false;
@@ -13,11 +14,12 @@ let isConnected = false;
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version } = await fetchLatestBaileysVersion();
+    console.log(`Using Baileys version v${version.join('.')}`);
 
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: ['Chrome (Linux)', '', '']
+        browser: ['Ubuntu', 'Chrome', '20.0.0']
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -25,7 +27,7 @@ async function startBot() {
         
         if (qr) {
             qrCodeData = qr;
-            console.log('New QR code generated for web view.');
+            console.log('📱 New QR code generated successfully.');
         }
 
         if (connection === 'open') {
@@ -37,10 +39,17 @@ async function startBot() {
         if (connection === 'close') {
             isConnected = false;
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log(`Connection closed. Reconnecting...`);
-            if (statusCode !== DisconnectReason.loggedOut) {
-                setTimeout(startBot, 3000);
+            console.log(`Connection closed. Reason:`, lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
+            
+            // Clear corrupted session if logged out or conflict occurs
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 440) {
+                console.log('Clearing corrupted auth state...');
+                try {
+                    fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                } catch (e) {}
             }
+            
+            setTimeout(startBot, 3000);
         }
     });
 
@@ -66,17 +75,28 @@ app.get('/', async (req, res) => {
         return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">✅ Bot is already connected to WhatsApp!</h1>');
     }
     if (!qrCodeData) {
-        return res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif;">⏳ Generating QR code, please refresh this page in 5 seconds...</h1>');
+        return res.send(`
+            <html>
+            <head><meta http-equiv="refresh" content="4"></head>
+            <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
+                <h2>⏳ Generating fresh QR code, please wait...</h2>
+                <p>This page will auto-refresh until the code appears.</p>
+            </body>
+            </html>
+        `);
     }
     try {
         const url = await qrcode.toDataURL(qrCodeData);
         res.send(`
-            <div style="text-align:center; margin-top:8vh; font-family:sans-serif;">
+            <html>
+            <head><meta http-equiv="refresh" content="15"></head>
+            <body style="text-align:center; margin-top:8vh; font-family:sans-serif;">
                 <h2>Scan this QR Code to Link WhatsApp Bot</h2>
                 <p>Open WhatsApp -> Linked Devices -> Link a Device</p>
                 <img src="${url}" alt="WhatsApp QR Code" style="width:320px; height:320px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
-                <p style="color:gray; font-size:14px; margin-top:20px;">Refresh this page if the code needs to be renewed.</p>
-            </div>
+                <p style="color:gray; font-size:14px; margin-top:20px;">Page auto-refreshes to keep your QR code active.</p>
+            </body>
+            </html>
         `);
     } catch (err) {
         res.status(500).send('Error generating QR code image');
