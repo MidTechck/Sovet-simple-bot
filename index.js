@@ -36,7 +36,7 @@ async function startBot() {
         if (!PHONE_NUMBER) {
             console.log("❌ Please set the PHONE_NUMBER variable in Railway!");
         } else {
-            console.log("⏳ Waiting 45 seconds for stable connection before generating code...");
+            console.log("⏳ Waiting 40 seconds for stable connection before generating code...");
             setTimeout(async () => {
                 try {
                     console.log("Requesting pairing code...");
@@ -47,7 +47,7 @@ async function startBot() {
                 } catch (err) {
                     console.error("Pairing code error:", err.message);
                 }
-            }, 45000);
+            }, 40000);
         }
     }
 
