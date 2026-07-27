@@ -87,7 +87,7 @@ app.get('/', (req, res) => {
                 <p>2. Tap Linked Devices -> Link a Device -> Link with phone number instead</p>
                 <p>3. Enter this code on your phone</p>
                 <br><br>
-                <a href="/">Generate New Code</a>
+                <a href="/reset">Generate New Code</a>
             </body>
             </html>
         `);
@@ -106,6 +106,17 @@ app.get('/', (req, res) => {
         </body>
         </html>
     `);
+});
+
+app.get('/reset', (req, res) => {
+    pairingCodeResult = '';
+    if (currentSock) {
+        try { currentSock.end(undefined); } catch (e) {}
+    }
+    try {
+        fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+    } catch (e) {}
+    res.redirect('/');
 });
 
 app.post('/pair', (req, res) => {
