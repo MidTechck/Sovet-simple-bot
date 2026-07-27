@@ -3,6 +3,7 @@ const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 
 const PHONE_NUMBER = process.env.PHONE_NUMBER;
+let pairingRequested = false;
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -19,6 +20,7 @@ async function startBot() {
         
         if (connection === 'open') {
             console.log('✅ Connected to WhatsApp successfully!');
+            pairingRequested = false;
         }
         
         if (connection === 'close') {
@@ -32,23 +34,20 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    if (!sock.authState.creds.registered) {
-        if (!PHONE_NUMBER) {
-            console.log("❌ Please set the PHONE_NUMBER variable in Railway!");
-        } else {
-            console.log("⏳ Waiting 40 seconds for stable connection before generating code...");
-            setTimeout(async () => {
-                try {
-                    console.log("Requesting pairing code...");
-                    const code = await sock.requestPairingCode(PHONE_NUMBER);
-                    console.log(`\n========================================`);
-                    console.log(`🔑 YOUR PAIRING CODE IS: ${code}`);
-                    console.log(`========================================\n`);
-                } catch (err) {
-                    console.error("Pairing code error:", err.message);
-                }
-            }, 40000);
-        }
+    if (!sock.authState.creds.registered && PHONE_NUMBER && !pairingRequested) {
+        pairingRequested = true;
+        setTimeout(async () => {
+            try {
+                console.log("Requesting pairing code...");
+                const code = await sock.requestPairingCode(PHONE_NUMBER);
+                console.log(`\n========================================`);
+                console.log(`🔑 YOUR PAIRING CODE IS: ${code}`);
+                console.log(`========================================\n`);
+            } catch (err) {
+                console.error("Pairing code error:", err.message);
+                pairingRequested = false;
+            }
+        }, 8000);
     }
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
