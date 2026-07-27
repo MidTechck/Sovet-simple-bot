@@ -18,6 +18,10 @@ async function startPairing(phoneNumber) {
         try { currentSock.end(undefined); } catch (e) {}
     }
 
+    if (!fs.existsSync('auth_info_baileys')) {
+        fs.mkdirSync('auth_info_baileys', { recursive: true });
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version } = await fetchLatestBaileysVersion();
 
@@ -64,7 +68,7 @@ async function startPairing(phoneNumber) {
             } catch (err) {
                 console.log('Failed to request pairing code:', err);
             }
-        }, 3000);
+        }, 4000);
     }
 }
 
@@ -82,6 +86,8 @@ app.get('/', (req, res) => {
                 <p>1. Open WhatsApp on your phone</p>
                 <p>2. Tap Linked Devices -> Link a Device -> Link with phone number instead</p>
                 <p>3. Enter this code on your phone</p>
+                <br><br>
+                <a href="/">Generate New Code</a>
             </body>
             </html>
         `);
@@ -105,13 +111,14 @@ app.get('/', (req, res) => {
 app.post('/pair', (req, res) => {
     const phone = req.body.phone;
     if (phone) {
+        pairingCodeResult = '';
         startPairing(phone);
         res.send(`
             <html>
-            <head><meta http-equiv="refresh" content="5"></head>
+            <head><meta http-equiv="refresh" content="4;url=/"></head>
             <body style="text-align:center; margin-top:15vh; font-family:sans-serif;">
                 <h2>Requesting pairing code from WhatsApp, please wait...</h2>
-                <p>This page will refresh automatically when the code is ready.</p>
+                <p>You will be redirected automatically once the code is ready.</p>
             </body>
             </html>
         `);
