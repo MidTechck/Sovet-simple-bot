@@ -11,13 +11,25 @@ const PORT = process.env.PORT || 8080;
 let qrCodeData = '';
 let isConnected = false;
 
+// Array of stable WhatsApp versions to rotate through if one fails
+const stableVersions = [
+    [2, 3000, 1033893291],
+    [2, 3000, 1027934701],
+    [2, 2413, 7]
+];
+let currentVersionIndex = 0;
+
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
+    const activeVersion = stableVersions[currentVersionIndex];
+    console.log('Attempting connection with version:', activeVersion.join('.'));
+
     const sock = makeWASocket({
         auth: state,
+        version: activeVersion,
         logger: pino({ level: 'silent' }),
-        browser: ['Mac OS', 'Safari', '17.0']
+        browser: ['Chrome', 'Windows', '110.0.5481.177']
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -40,13 +52,16 @@ async function startBot() {
             console.log('Connection closed. Reason:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 440) {
-                console.log('Clearing auth state due to error...');
+                console.log('Clearing auth state and switching to next version...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
+
+                // Automatically rotate to the next version in the list
+                currentVersionIndex = (currentVersionIndex + 1) % stableVersions.length;
             }
             
-            setTimeout(startBot, 3000);
+            setTimeout(startBot, 5000);
         }
     });
 
