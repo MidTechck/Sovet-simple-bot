@@ -16,7 +16,6 @@ async function startBot() {
 
     const sock = makeWASocket({
         auth: state,
-        version: [2, 3000, 1033893291],
         logger: pino({ level: 'silent' }),
         browser: ['Mac OS', 'Safari', '17.0']
     });
