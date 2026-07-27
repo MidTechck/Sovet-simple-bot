@@ -1,7 +1,8 @@
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
-const qrcode = require('qrcode-terminal');
+
+const PHONE_NUMBER = process.env.PHONE_NUMBER; // Client's phone number with country code (e.g., 2609XXXXXXXX)
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -11,18 +12,12 @@ async function startBot() {
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: ['Simple Bot', 'Chrome', '10.0'],
-        version: version
+        browser: ['Chrome (Linux)', '', '']
     });
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
         
-        if (qr) {
-            console.log('\nScan this QR code with WhatsApp:');
-            qrcode.generate(qr, { small: true });
-        }
-
         if (connection === 'close') {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log(`Connection closed. Reconnecting...`);
@@ -36,6 +31,23 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    if (!sock.authState.creds.registered) {
+        if (!PHONE_NUMBER) {
+            console.log("❌ Please set the PHONE_NUMBER environment variable in Railway!");
+        } else {
+            setTimeout(async () => {
+                try {
+                    const code = await sock.requestPairingCode(PHONE_NUMBER);
+                    console.log(`\n========================================`);
+                    console.log(`🔑 YOUR PAIRING CODE IS: ${code}`);
+                    console.log(`========================================\n`);
+                } catch (err) {
+                    console.error("Error getting pairing code:", err);
+                }
+            }, 4000);
+        }
+    }
+
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -45,7 +57,6 @@ async function startBot() {
 
         console.log(`Received message from ${sender}: ${text}`);
 
-        // Simple keyword logic (expandable later)
         if (text.includes('hello') || text.includes('hi')) {
             await sock.sendMessage(sender, { text: 'Hello! Thanks for reaching out. How can we help you today?' });
         } else if (text.includes('price') || text.includes('cost')) {
