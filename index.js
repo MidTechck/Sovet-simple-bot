@@ -8,9 +8,40 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Put your NVIDIA API key here or use process.env.NVIDIA_API_KEY
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "YOUR_NVIDIA_API_KEY_HERE";
+
 let qrCodeData = '';
 let isConnected = false;
 let currentSock = null;
+
+async function getNvidiaResponse(userMessage) {
+    try {
+        const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${NVIDIA_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "nvidia/llama-3.1-nemotron-70b-instruct",
+                messages: [{ role: "user", content: userMessage }],
+                max_tokens: 512,
+                temperature: 0.5
+            })
+        });
+
+        const data = await response.json();
+        if (data.choices && data.choices.length > 0) {
+            return data.choices[0].message.content;
+        } else {
+            return "Sorry, I couldn't generate a response from NVIDIA AI.";
+        }
+    } catch (err) {
+        console.error("NVIDIA API Error:", err);
+        return "Error connecting to NVIDIA AI service.";
+    }
+}
 
 async function startBot() {
     if (currentSock) {
@@ -70,13 +101,19 @@ async function startBot() {
         if (!msg.message || msg.key.fromMe) return;
 
         const sender = msg.key.remoteJid;
-        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').toLowerCase();
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
 
-        if (text.includes('hello') || text.includes('hi')) {
-            await sock.sendMessage(sender, { text: 'Hello! Thanks for reaching out. How can we help you today?' });
-        } else {
-            await sock.sendMessage(sender, { text: 'Got your message! We will get back to you shortly.' });
-        }
+        if (!text) return;
+
+        console.log(`Received message: "${text}" from ${sender}`);
+        
+        // Show typing indicator on WhatsApp
+        await sock.sendPresenceUpdate('composing', sender);
+
+        // Get AI answer from NVIDIA NIM API
+        const aiReply = await getNvidiaResponse(text);
+        
+        await sock.sendMessage(sender, { text: aiReply });
     });
 }
 
