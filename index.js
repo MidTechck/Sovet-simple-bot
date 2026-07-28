@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
@@ -8,39 +9,70 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// NVIDIA API Key from environment variable
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "YOUR_NVIDIA_API_KEY_HERE";
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
 
 let qrCodeData = '';
 let isConnected = false;
 let currentSock = null;
 
-// In-memory conversation history per sender JID for natural context memory
+// In-memory conversation history and stage tracking per sender JID
 const chatHistories = {};
 
-const SYSTEM_PROMPT = `You are a friendly, professional human customer support representative working for Sovet Link Technologies (Sovet Link Zambia), a leading IT infrastructure and connectivity company based in Lusaka (Woodlands) and Ndola, providing services across Zambia.
+const SYSTEM_PROMPT = `You are a human customer support representative working for Sovet Link Technologies in Zambia (based in Lusaka Woodlands and Ndola). You talk to clients over WhatsApp 24/7.
 
-Your job is to assist clients over WhatsApp 24/7, answering inquiries naturally, warmly, and like a real human employee—never sound like a rigid robot.
+CRITICAL FORMATTING RULES:
+- Write ONLY in natural, conversational human paragraphs. 
+- NEVER use bullet points, lists, asterisks, or rigid templates. Talk just like a real person texting on WhatsApp.
+- Keep your replies concise, friendly, and engaging.
 
-COMPANY SERVICES & PRICING KNOWLEDGE:
-- Starlink Internet Installation: Professional dish mounting, cable routing, full network & WiFi setup for homes, schools, businesses, and offices. 
-  * Starlink Gen 3: from K9,000
-  * Starlink Mini: from K6,800
-  * Monthly unlimited internet subscriptions: from K800
-- CCTV Security Camera Supply & Installation: Single-camera households to multi-camera shops and offices, remote phone viewing setup, post-installation support.
-- Networking Solutions: LAN setup, structured cabling, Wi-Fi coverage planning for offices/schools, network upgrades.
-- IT Support Services: Ongoing troubleshooting, network maintenance, tech support.
-- Site surveys and consultations.
+CONVERSATION STAGES & AWARENESS:
+1. Greeting & New Chat: If the conversation is brand new, warmly greet the client, introduce yourself casually, and ask how you can help them today.
+2. Discovery & Needs Identification: Understand if they need Starlink internet, CCTV security, networking, or general IT support. Never guess blindly; ask clarifying questions.
+3. Solution & Pricing Knowledge: Match their needs with accurate company info:
+   - Starlink Internet: Gen 3 from K9,000, Mini from K6,800, monthly unlimited internet from K800.
+   - CCTV Systems: Supply, installation, and remote phone viewing setup for homes and offices.
+   - Networking & IT Support: LAN setups, structured cabling, Wi-Fi planning, and ongoing troubleshooting.
+4. Call to Action / Closing: Guide them toward booking a site consultation or calling our team at +260 968 252 812.
 
-COVERAGE & HOURS:
-- Based in Lusaka (Woodlands) and Ndola, serving clients across Zambia.
-- Contact: +260 968 252 812 | info@sovetlink.com
-- Office working hours: Monday to Sunday, 08:00 - 18:00.
-
-BOUNDARIES & BEHAVIOR:
-- If a user asks you to write code or help with software development/programming, do NOT say yes or act as a coding bot. Politely clarify that as a Sovet Link representative, you specialize in physical IT infrastructure, Starlink, CCTV, networking, and technical support rather than software coding.
-- Keep responses concise, helpful, and conversational, matching natural WhatsApp messaging style. Avoid overly long blocks of text unless detailing a quotation or service specs.
+BOUNDARIES:
+- If a client asks you to write code or do software programming, politely decline as a human employee, explaining that Sovet Link focuses entirely on physical IT infrastructure, Starlink, CCTV, and networking.
 `;
+
+// Array of NVIDIA NIM models to try in sequence if one fails
+const NVIDIA_MODELS = [
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "meta/llama-3.1-70b-instruct",
+    "google/gemma-2-27b-it"
+];
+
+async function callNvidiaWithFallback(messages) {
+    for (const model of NVIDIA_MODELS) {
+        try {
+            const response = "https://integrate.api.nvidia.com/v1/chat/completions";
+            const res = await fetch(response, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${NVIDIA_API_KEY}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: messages,
+                    max_tokens: 500,
+                    temperature: 0.6
+                })
+            });
+
+            const data = await res.json();
+            if (data.choices && data.choices.length > 0) {
+                return data.choices[0].message.content;
+            }
+        } catch (err) {
+            console.log(`Model ${model} failed, trying next fallback...`);
+        }
+    }
+    return null;
+}
 
 async function getNvidiaResponse(sender, userMessage) {
     if (!chatHistories[sender]) {
@@ -49,10 +81,9 @@ async function getNvidiaResponse(sender, userMessage) {
         ];
     }
 
-    // Add user message to history
     chatHistories[sender].push({ role: "user", content: userMessage });
 
-    // Keep history length manageable (last 15 messages + system prompt)
+    // Keep history trimmed to avoid token overflow
     if (chatHistories[sender].length > 16) {
         chatHistories[sender] = [
             chatHistories[sender][0],
@@ -60,33 +91,13 @@ async function getNvidiaResponse(sender, userMessage) {
         ];
     }
 
-    try {
-        const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${NVIDIA_API_KEY}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                model: "nvidia/llama-3.1-nemotron-70b-instruct",
-                messages: chatHistories[sender],
-                max_tokens: 512,
-                temperature: 0.6
-            })
-        });
+    const aiReply = await callNvidiaWithFallback(chatHistories[sender]);
 
-        const data = await response.json();
-        if (data.choices && data.choices.length > 0) {
-            const aiReply = data.choices[0].message.content;
-            // Save assistant reply to history
-            chatHistories[sender].push({ role: "assistant", content: aiReply });
-            return aiReply;
-        } else {
-            return "Hello! I'm having a brief moment connecting to our network. How can I help you with Starlink, CCTV, or networking today?";
-        }
-    } catch (err) {
-        console.error("NVIDIA API Error:", err);
-        return "Sorry about that! Our system encountered a minor glitch. Feel free to call us directly at +260 968 252 812.";
+    if (aiReply) {
+        chatHistories[sender].push({ role: "assistant", content: aiReply });
+        return aiReply;
+    } else {
+        return "Hey there! I am having a tiny connection hiccup reaching our server right now. Feel free to call us directly at +260 968 252 812 so we can assist you right away.";
     }
 }
 
@@ -128,10 +139,9 @@ async function startBot() {
         if (connection === 'close') {
             isConnected = false;
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log('Connection closed. Reason:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
+            console.log('Connection closed. Status:', statusCode);
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 440) {
-                console.log('Clearing auth state due to error...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
@@ -152,18 +162,17 @@ async function startBot() {
 
         if (!text) return;
 
-        console.log(`Received message: "${text}" from ${sender}`);
+        console.log(`Received message from ${sender}: "${text}"`);
         
-        // Show human-like typing presence indicator
         await sock.sendPresenceUpdate('composing', sender);
 
-        // Smart delay based on response length or natural typing pause (2 to 4 seconds)
         const aiReply = await getNvidiaResponse(sender, text);
+        
+        // Smart typing delay based on response length (2 to 5 seconds)
         const typingDelay = Math.min(Math.max(aiReply.length * 20, 2000), 5000);
-        
         await new Promise(resolve => setTimeout(resolve, typingDelay));
-        await sock.sendPresenceUpdate('paused', sender);
         
+        await sock.sendPresenceUpdate('paused', sender);
         await sock.sendMessage(sender, { text: aiReply });
     });
 }
