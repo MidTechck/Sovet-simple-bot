@@ -1,19 +1,18 @@
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
+const qrcode = require('qrcode');
 const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-app.use(express.urlencoded({ extended: true }));
-
-let currentSock = null;
-let pairingCodeResult = '';
+let qrCodeData = '';
 let isConnected = false;
+let currentSock = null;
 
-async function startPairing(phoneNumber) {
+async function startBot() {
     if (currentSock) {
         try { currentSock.end(undefined); } catch (e) {}
     }
@@ -29,116 +28,93 @@ async function startPairing(phoneNumber) {
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: ['Chrome', 'Mac OS', '10.15.7']
+        browser: ['Mac OS', 'Safari', '17.0']
     });
 
     currentSock = sock;
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            qrCodeData = qr;
+            console.log('New QR code generated successfully.');
+        }
 
         if (connection === 'open') {
             isConnected = true;
-            pairingCodeResult = '';
-            console.log('Connected to WhatsApp successfully.');
+            qrCodeData = '';
+            console.log('Connected to WhatsApp successfully!');
         }
-
+        
         if (connection === 'close') {
             isConnected = false;
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log('Connection closed. Status:', statusCode);
-
+            console.log('Connection closed. Reason:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Status:', statusCode);
+            
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 440) {
+                console.log('Clearing auth state due to error...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
             }
+            
+            setTimeout(startBot, 5000);
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    if (!sock.authState.creds.registered) {
-        const cleanedNumber = phoneNumber.replace(/[^0-9]/g, '');
-        setTimeout(async () => {
-            try {
-                const code = await sock.requestPairingCode(cleanedNumber);
-                pairingCodeResult = code;
-                console.log('Pairing code generated:', code);
-            } catch (err) {
-                console.log('Failed to request pairing code:', err);
-            }
-        }, 4000);
-    }
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const sender = msg.key.remoteJid;
+        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').toLowerCase();
+
+        if (text.includes('hello') || text.includes('hi')) {
+            await sock.sendMessage(sender, { text: 'Hello! Thanks for reaching out. How can we help you today?' });
+        } else {
+            await sock.sendMessage(sender, { text: 'Got your message! We will get back to you shortly.' });
+        }
+    });
 }
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
     if (isConnected) {
-        return res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif; color:green;">Bot is already connected to WhatsApp.</h1>');
+        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is already connected to WhatsApp!</h1>');
     }
-
-    if (pairingCodeResult) {
+    if (!qrCodeData) {
         return res.send(`
             <html>
-            <body style="text-align:center; margin-top:15vh; font-family:sans-serif;">
-                <h2>Your WhatsApp Pairing Code</h2>
-                <p style="font-size:48px; font-weight:bold; letter-spacing:6px; color:#25D366;">${pairingCodeResult}</p>
-                <p>1. Open WhatsApp on your phone</p>
-                <p>2. Tap Linked Devices -> Link a Device -> Link with phone number instead</p>
-                <p>3. Enter this code on your phone</p>
-                <br><br>
-                <a href="/reset">Generate New Code</a>
+            <head><meta http-equiv="refresh" content="4"></head>
+            <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
+                <h2>Generating fresh QR code, please wait...</h2>
+                <p>This page will auto-refresh until the code appears.</p>
             </body>
             </html>
         `);
-    }
-
-    res.send(`
-        <html>
-        <body style="text-align:center; margin-top:15vh; font-family:sans-serif;">
-            <h2>WhatsApp Bot Pairing</h2>
-            <form action="/pair" method="POST">
-                <p>Enter your WhatsApp phone number with country code (e.g. 260XXXXXXXXX):</p>
-                <input type="text" name="phone" placeholder="260..." style="padding:10px; font-size:16px; width:260px;" required />
-                <br><br>
-                <button type="submit" style="padding:10px 20px; font-size:16px; background:#25D366; color:white; border:none; cursor:pointer;">Generate Pairing Code</button>
-            </form>
-        </body>
-        </html>
-    `);
-});
-
-app.get('/reset', (req, res) => {
-    pairingCodeResult = '';
-    if (currentSock) {
-        try { currentSock.end(undefined); } catch (e) {}
     }
     try {
-        fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-    } catch (e) {}
-    res.redirect('/');
-});
-
-app.post('/pair', (req, res) => {
-    const phone = req.body.phone;
-    if (phone) {
-        pairingCodeResult = '';
-        startPairing(phone);
+        const url = await qrcode.toDataURL(qrCodeData);
         res.send(`
             <html>
-            <head><meta http-equiv="refresh" content="4;url=/"></head>
-            <body style="text-align:center; margin-top:15vh; font-family:sans-serif;">
-                <h2>Requesting pairing code from WhatsApp, please wait...</h2>
-                <p>You will be redirected automatically once the code is ready.</p>
+            <head><meta http-equiv="refresh" content="15"></head>
+            <body style="text-align:center; margin-top:8vh; font-family:sans-serif;">
+                <h2>Scan this QR Code to Link WhatsApp Bot</h2>
+                <p>Open WhatsApp - Linked Devices - Link a Device</p>
+                <img src="${url}" alt="WhatsApp QR Code" style="width:320px; height:320px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
+                <p style="color:gray; font-size:14px; margin-top:20px;">Page auto-refreshes to keep your QR code active.</p>
             </body>
             </html>
         `);
-    } else {
-        res.redirect('/');
+    } catch (err) {
+        res.status(500).send('Error generating QR code image');
     }
 });
 
 app.listen(PORT, () => {
     console.log('Server running on port ' + PORT);
+    startBot();
 });
 
