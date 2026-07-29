@@ -182,6 +182,18 @@ function getTimeBasedGreeting() {
     return getRandomReply('evening');
 }
 
+// Automated Lead Logger function
+function logLead(sender, text, replyText) {
+    const timestamp = new Date().toLocaleString();
+    const cleanNumber = sender.replace('@s.whatsapp.net', '');
+    const logEntry = `----------------------------------------\n[${timestamp}] Client: +${cleanNumber}\nMessage: "${text}"\nBot Reply: "${replyText}"\n`;
+    try {
+        fs.appendFileSync('leads.txt', logEntry + '\n');
+    } catch (err) {
+        console.log('Failed to write lead to file:', err);
+    }
+}
+
 function processMessage(sender, text) {
     const lower = text.toLowerCase();
 
@@ -334,7 +346,6 @@ async function startBot() {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log('Connection closed. Status:', statusCode);
             
-            
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
                 console.log('Session invalidated. Clearing auth state...');
                 try {
@@ -381,6 +392,9 @@ async function startBot() {
 
         const replyText = processMessage(sender, text);
         
+        // Save lead automatically to leads.txt
+        logLead(sender, text, replyText);
+
         const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
