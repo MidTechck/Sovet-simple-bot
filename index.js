@@ -15,7 +15,7 @@ let currentSock = null;
 
 const userSessions = {};
 
-// 30 Comprehensive response pools with 3+ natural variations. Strictly NO emojis and NO exclamation marks (!)
+// Expanded response pools designed with natural, human-like phrasing. Strictly NO emojis and NO exclamation marks (!)
 const responsePools = {
     location: [
         "We are based in Lusaka Woodlands and Ndola, and we serve clients across Zambia. Would you like us to check coverage for your specific location.",
@@ -26,6 +26,11 @@ const responsePools = {
         "We operate from Monday to Sunday between 08:00 and 18:00. Are you looking to schedule a visit during these hours.",
         "Our team is available every day of the week from 08:00 to 18:00. Let me know what time works best for your schedule.",
         "We are open Monday through Sunday, 08:00 to 18:00 daily. Do you need assistance right now or for a future date."
+    ],
+    night_active: [
+        "I notice you are messaging late at night. Our technical desk is closed until morning, but I have saved your details and our team will review it first thing at 08:00.",
+        "Thanks for reaching out during the night hours. While our physical offices are offline, your inquiry is logged and a team member will address it in the morning.",
+        "It is past our normal operating hours, but your message has been recorded safely. We will get back to you as soon as business hours resume."
     ],
     starlink_price: [
         "Starlink Gen 3 starts from K9,000 and Starlink Mini starts from K6,800. Would you like details on monthly data packages as well.",
@@ -91,6 +96,21 @@ const responsePools = {
         "Please note that payments are not processed automatically here. Our team will verify and confirm your details manually before any work begins.",
         "Our team handles payment verifications offline to ensure complete security. Kindly share your transaction details, and we will review and confirm shortly.",
         "We require manual verification by our finance team for all payments to ensure safety. Let me know once you are ready to process your transaction."
+    ],
+    hardware_availability: [
+        "We keep standard stock of both Starlink kits and CCTV camera packages ready for deployment. Are you looking to pick up hardware or have it delivered and installed.",
+        "Our inventory is regularly stocked with immediate hardware supplies. Let me know the specific items you are looking for so I can confirm availability.",
+        "We maintain steady hardware stock for quick deployments across our service zones. Do you need immediate supply or scheduling for next week."
+    ],
+    wifi_troubleshoot: [
+        "If your Wi-Fi connection is dropping or slow, restarting your router and checking cable connections is a good first step. Are you using a router connected to Starlink or standard broadband.",
+        "Network connection issues can often be resolved by power-cycling your equipment. Let me know what specific error or symptoms your network is showing.",
+        "We help troubleshoot local Wi-Fi and routing issues. Is this affecting a single device or your entire office network."
+    ],
+    quote_request: [
+        "To give you an accurate price quote, we usually look at the scope of work and location details. Can you share a brief description of what you want set up.",
+        "We provide detailed quotations after gathering your project specifications. Tell me a bit about your property or business needs.",
+        "Our team prepares customized quotes based on your exact site requirements. What specific services are you budgeting for."
     ],
     morning: [
         "Good morning. How can I assist you with your inquiry today.",
@@ -177,12 +197,12 @@ function getRandomReply(category) {
 
 function getTimeBasedGreeting() {
     const hour = new Date().getHours();
+    if (hour >= 0 && hour < 5) return getRandomReply('night_active');
     if (hour < 12) return getRandomReply('morning');
     if (hour < 17) return getRandomReply('afternoon');
     return getRandomReply('evening');
 }
 
-// Automated Lead Logger function
 function logLead(sender, text, replyText) {
     const timestamp = new Date().toLocaleString();
     const cleanNumber = sender.replace('@s.whatsapp.net', '');
@@ -196,11 +216,19 @@ function logLead(sender, text, replyText) {
 
 function processMessage(sender, text) {
     const lower = text.toLowerCase();
+    const currentHour = new Date().getHours();
+    const isNightTime = currentHour >= 0 && currentHour < 5;
 
     if (!userSessions[sender]) {
         userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0 };
     }
     userSessions[sender].messageCount += 1;
+
+    // If it is late night (00:00 to 05:00), route standard initial inquiries to night_active mode
+    if (isNightTime && userSessions[sender].firstContact && !lower.includes('urgent') && !lower.includes('emergency')) {
+        userSessions[sender].firstContact = false;
+        return getRandomReply('night_active');
+    }
 
     // 1. Payment / Buying safeguard
     if (lower.includes('pay') || lower.includes('buy') || lower.includes('deposit') || lower.includes('transfer') || lower.includes('send money') || lower.includes('paid') || lower.includes('bank') || lower.includes('momo') || lower.includes('airtel money')) {
@@ -237,9 +265,18 @@ function processMessage(sender, text) {
         return getRandomReply('bot_check');
     }
 
-    // 6. Question prompt
+    // 6. Question prompt & Quote / Availability requests
     if (lower.includes('question') || lower.includes('ask')) {
         return getRandomReply('question_prompt');
+    }
+    if (lower.includes('stock') || lower.includes('available') || lower.includes('have you got') || lower.includes('in store')) {
+        return getRandomReply('hardware_availability');
+    }
+    if (lower.includes('quote') || lower.includes('quotation') || lower.includes('estimate')) {
+        return getRandomReply('quote_request');
+    }
+    if (lower.includes('slow') || lower.includes('disconnect') || lower.includes('router') || lower.includes('signal')) {
+        return getRandomReply('wifi_troubleshoot');
     }
 
     // 7. Location & Coverage
@@ -267,7 +304,7 @@ function processMessage(sender, text) {
         return getRandomReply('company_info');
     }
 
-    // 12. Multi-topic or specific services (Starlink, CCTV, Network, Pricing checks)
+      // 12. Multi-topic or specific services (Starlink, CCTV, Network, Pricing checks)
     const asksPrice = lower.includes('price') || lower.includes('cost') || lower.includes('how much') || lower.includes('fee') || lower.includes('rates') || lower.includes('k9') || lower.includes('k8') || lower.includes('k6');
     const mentionsStarlink = lower.includes('starlink') || lower.includes('dish') || lower.includes('internet');
     const mentionsCCTV = lower.includes('cctv') || lower.includes('camera') || lower.includes('security') || lower.includes('surveillance');
@@ -369,11 +406,10 @@ async function startBot() {
             userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0 };
         }
 
-        // HUMAN TAKEOVER GUARD: If YOU or a team member sends a message in this chat, 
-        // mute the bot for this user for 30 minutes so you can chat freely without the bot interfering.
+        // HUMAN TAKEOVER GUARD: Extended to 1 HOUR (60 minutes) if you or your team reply manually.
         if (msg.key.fromMe) {
-            userSessions[sender].pausedUntil = Date.now() + (30 * 60 * 1000);
-            console.log(`Human agent active in chat ${sender}. Bot paused for 30 minutes.`);
+            userSessions[sender].pausedUntil = Date.now() + (60 * 60 * 1000);
+            console.log(`Human agent active in chat ${sender}. Bot paused for 1 hour.`);
             return;
         }
 
@@ -387,12 +423,10 @@ async function startBot() {
 
         console.log(`Received message from ${sender}: "${text}"`);
         
-        // Smart delay & typing animation
         await sock.sendPresenceUpdate('composing', sender);
 
         const replyText = processMessage(sender, text);
         
-        // Save lead automatically to leads.txt
         logLead(sender, text, replyText);
 
         const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
@@ -428,7 +462,7 @@ app.get('/', async (req, res) => {
                 <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
                 <img src="${url}" alt="WhatsApp QR Code" style="width:300px; height:300px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
                 <p style="color:gray; font-size:14px; margin-top:15px;">Page auto-refreshes to keep your QR session active.</p>
-            </body>
+            /body>
             </html>
         `);
     } catch (err) {
