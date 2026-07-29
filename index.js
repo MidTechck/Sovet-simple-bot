@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
@@ -15,7 +15,6 @@ let qrCodeData = '';
 let isConnected = false;
 let currentSock = null;
 
-// In-memory conversation history and stage tracking per sender JID
 const chatHistories = {};
 
 const SYSTEM_PROMPT = `You are a human customer support representative working for Sovet Link Technologies in Zambia (based in Lusaka Woodlands and Ndola). You talk to clients over WhatsApp 24/7.
@@ -38,7 +37,6 @@ BOUNDARIES:
 - If a client asks you to write code or do software programming, politely decline as a human employee, explaining that Sovet Link focuses entirely on physical IT infrastructure, Starlink, CCTV, and networking.
 `;
 
-// Array of NVIDIA NIM models to try in sequence if one fails
 const NVIDIA_MODELS = [
     "nvidia/llama-3.1-nemotron-70b-instruct",
     "meta/llama-3.1-70b-instruct",
@@ -48,8 +46,7 @@ const NVIDIA_MODELS = [
 async function callNvidiaWithFallback(messages) {
     for (const model of NVIDIA_MODELS) {
         try {
-            const response = "https://integrate.api.nvidia.com/v1/chat/completions";
-            const res = await fetch(response, {
+            const res = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
                     "Authorization": `Bearer ${NVIDIA_API_KEY}`,
@@ -83,7 +80,6 @@ async function getNvidiaResponse(sender, userMessage) {
 
     chatHistories[sender].push({ role: "user", content: userMessage });
 
-    // Keep history trimmed to avoid token overflow
     if (chatHistories[sender].length > 16) {
         chatHistories[sender] = [
             chatHistories[sender][0],
@@ -106,10 +102,6 @@ async function startBot() {
         try { currentSock.end(undefined); } catch (e) {}
     }
 
-    if (!fs.existsSync('auth_info_baileys')) {
-        fs.mkdirSync('auth_info_baileys', { recursive: true });
-    }
-
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version } = await fetchLatestBaileysVersion();
 
@@ -117,7 +109,8 @@ async function startBot() {
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: ['Mac OS', 'Safari', '17.0']
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false
     });
 
     currentSock = sock;
@@ -141,13 +134,15 @@ async function startBot() {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log('Connection closed. Status:', statusCode);
             
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 440) {
+            // If logged out or persistent handshake error, wipe auth session for a clean QR regeneration
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
+                console.log('Session invalidated or blocked. Clearing auth state for fresh pairing...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
             }
             
-            setTimeout(startBot, 5000);
+            setTimeout(startBot, 4000);
         }
     });
 
@@ -168,7 +163,6 @@ async function startBot() {
 
         const aiReply = await getNvidiaResponse(sender, text);
         
-        // Smart typing delay based on response length (2 to 5 seconds)
         const typingDelay = Math.min(Math.max(aiReply.length * 20, 2000), 5000);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
@@ -179,15 +173,15 @@ async function startBot() {
 
 app.get('/', async (req, res) => {
     if (isConnected) {
-        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is already connected to WhatsApp!</h1>');
+        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is successfully connected to WhatsApp!</h1>');
     }
     if (!qrCodeData) {
         return res.send(`
             <html>
-            <head><meta http-equiv="refresh" content="4"></head>
+            <head><meta http-equiv="refresh" content="3"></head>
             <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
-                <h2>Generating fresh QR code, please wait...</h2>
-                <p>This page will auto-refresh until the code appears.</p>
+                <h2>Initializing WhatsApp session and generating fresh QR code...</h2>
+                <p>This page will auto-refresh in a moment.</p>
             </body>
             </html>
         `);
@@ -196,12 +190,12 @@ app.get('/', async (req, res) => {
         const url = await qrcode.toDataURL(qrCodeData);
         res.send(`
             <html>
-            <head><meta http-equiv="refresh" content="15"></head>
-            <body style="text-align:center; margin-top:8vh; font-family:sans-serif;">
-                <h2>Scan this QR Code to Link WhatsApp Bot</h2>
-                <p>Open WhatsApp - Linked Devices - Link a Device</p>
-                <img src="${url}" alt="WhatsApp QR Code" style="width:320px; height:320px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
-                <p style="color:gray; font-size:14px; margin-top:20px;">Page auto-refreshes to keep your QR code active.</p>
+            <head><meta http-equiv="refresh" content="12"></head>
+            <body style="text-align:center; margin-top:6vh; font-family:sans-serif;">
+                <h2>Scan QR Code to Link WhatsApp Bot</h2>
+                <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
+                <img src="${url}" alt="WhatsApp QR Code" style="width:300px; height:300px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
+                <p style="color:gray; font-size:14px; margin-top:15px;">Page auto-refreshes to keep your QR session active.</p>
             </body>
             </html>
         `);
