@@ -38,7 +38,6 @@ BOUNDARIES:
 `;
 
 const NVIDIA_MODELS = [
-    "nvidia/llama-3.1-nemotron-70b-instruct",
     "meta/llama-3.1-70b-instruct",
     "google/gemma-2-27b-it"
 ];
