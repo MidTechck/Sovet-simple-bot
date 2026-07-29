@@ -177,7 +177,33 @@ app.get('/', async (req, res) => {
     if (isConnected) {
         return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is successfully connected to WhatsApp!</h1>');
     }
-    res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is running and attempting connection...</h1>');
+    if (!qrCodeData) {
+        return res.send(`
+            <html>
+            <head><meta http-equiv="refresh" content="3"></head>
+            <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
+                <h2>Initializing WhatsApp session and generating fresh QR code...</h2>
+                <p>This page will auto-refresh in a moment.</p>
+            </body>
+            </html>
+        `);
+    }
+    try {
+        const url = await qrcode.toDataURL(qrCodeData);
+        res.send(`
+            <html>
+            <head><meta http-equiv="refresh" content="12"></head>
+            <body style="text-align:center; margin-top:6vh; font-family:sans-serif;">
+                <h2>Scan QR Code to Link WhatsApp Bot</h2>
+                <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
+                <img src="${url}" alt="WhatsApp QR Code" style="width:300px; height:300px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
+                <p style="color:gray; font-size:14px; margin-top:15px;">Page auto-refreshes to keep your QR session active.</p>
+            </body>
+            </html>
+        `);
+    } catch (err) {
+        res.status(500).send('Error generating QR code image');
+    }
 });
 
 app.listen(PORT, () => {
