@@ -46,10 +46,11 @@ const NVIDIA_MODELS = [
 async function callNvidiaWithFallback(messages) {
     for (const model of NVIDIA_MODELS) {
         try {
+            console.log(`Attempting AI call with model: ${model}`);
             const res = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
-                    "Authorization": `Bearer ${NVIDIA_API_KEY}`,
+                    "Authorization": `Bearer ${NVIDIA_API_KEY.trim()}`,
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
@@ -61,11 +62,14 @@ async function callNvidiaWithFallback(messages) {
             });
 
             const data = await res.json();
-            if (data.choices && data.choices.length > 0) {
+            if (res.ok && data.choices && data.choices.length > 0) {
+                console.log(`Successfully received response from ${model}`);
                 return data.choices[0].message.content;
+            } else {
+                console.log(`Model ${model} returned non-OK status or empty choices:`, JSON.stringify(data));
             }
         } catch (err) {
-            console.log(`Model ${model} failed, trying next fallback...`);
+            console.log(`Model ${model} fetch exception error:`, err.message);
         }
     }
     return null;
@@ -134,9 +138,8 @@ async function startBot() {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log('Connection closed. Status:', statusCode);
             
-            // If logged out or persistent handshake error, wipe auth session for a clean QR regeneration
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
-                console.log('Session invalidated or blocked. Clearing auth state for fresh pairing...');
+                console.log('Session invalidated. Clearing auth state...');
                 try {
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 } catch (e) {}
@@ -175,33 +178,7 @@ app.get('/', async (req, res) => {
     if (isConnected) {
         return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is successfully connected to WhatsApp!</h1>');
     }
-    if (!qrCodeData) {
-        return res.send(`
-            <html>
-            <head><meta http-equiv="refresh" content="3"></head>
-            <body style="text-align:center; margin-top:20vh; font-family:sans-serif;">
-                <h2>Initializing WhatsApp session and generating fresh QR code...</h2>
-                <p>This page will auto-refresh in a moment.</p>
-            </body>
-            </html>
-        `);
-    }
-    try {
-        const url = await qrcode.toDataURL(qrCodeData);
-        res.send(`
-            <html>
-            <head><meta http-equiv="refresh" content="12"></head>
-            <body style="text-align:center; margin-top:6vh; font-family:sans-serif;">
-                <h2>Scan QR Code to Link WhatsApp Bot</h2>
-                <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
-                <img src="${url}" alt="WhatsApp QR Code" style="width:300px; height:300px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
-                <p style="color:gray; font-size:14px; margin-top:15px;">Page auto-refreshes to keep your QR session active.</p>
-            </body>
-            </html>
-        `);
-    } catch (err) {
-        res.status(500).send('Error generating QR code image');
-    }
+    res.send('<h1 style="text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is running and attempting connection...</h1>');
 });
 
 app.listen(PORT, () => {
