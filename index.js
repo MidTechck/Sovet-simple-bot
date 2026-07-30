@@ -1,7 +1,6 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
 
 dotenv.config();
 
@@ -14,6 +13,9 @@ const MUTE_DURATION = 45 * 60 * 1000; // 45 minutes
 
 // In-memory conversation history store for contextual awareness
 const chatHistories = new Map(); // senderNumber -> array of messages
+
+// Helper function for typing delay
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- AI GENERATION WITH MULTI-TIER FALLBACK ---
 async function generateAIResponse(senderNumber, userMessage) {
@@ -28,9 +30,10 @@ async function generateAIResponse(senderNumber, userMessage) {
     const systemPrompt = `You are a friendly, concise human representative for Trustwave Technologies Ltd on WhatsApp. 
 Keep your responses short, natural, direct, and conversational (1-2 sentences max). 
 Never use robotic corporate intros like "Hello, I am the assistant for...". Talk like a real person typing quickly on a phone.
+If you don't know an exact price for a custom installation, say: "I can have our team calculate a quote for your setup and get back to you shortly."
 Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.`;
 
-    // 1. TRY GEMINI API FIRST
+    // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
         try {
             const geminiMessages = [
@@ -55,7 +58,7 @@ Services provided: CCTV cameras, access control systems, IT security services, a
         }
     }
 
-    // 2. TRY NVIDIA API SECONDARY BACKUP
+    // 2. SECONDARY BACKUP: NVIDIA API
     if (NVIDIA_API_KEY) {
         try {
             const nvidiaMessages = [
@@ -88,13 +91,15 @@ Services provided: CCTV cameras, access control systems, IT security services, a
         }
     }
 
-    // 3. KEYWORD FALLBACK (Ultimate Backup)
+    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
     if (lower.includes('cctv') || lower.includes('camera')) {
         return "We install HD CCTV cameras with remote phone viewing. Want a quick quote?";
+    } else if (lower.includes('starlink') || lower.includes('internet')) {
+        return "We do full Starlink installations and network extensions. Are you looking to set up a new dish?";
     } else if (lower.includes('price') || lower.includes('cost')) {
-        return "Our pricing depends on your exact setup. Would you like a technician to visit and assess?";
-    } else if (lower.includes('hello') || lower.includes('hi')) {
+        return "Our pricing depends on your exact setup. Would you like a technician to assess your site?";
+    } else if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
         return "Hey there! How can we help you with your security or IT systems today?";
     }
 
@@ -108,44 +113,54 @@ async function startBot() {
         logger: pino({ level: 'silent' })
     });
 
-    sock.udarstven?.('creds.update', saveCreds);
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, qr } = update;
+        const { connection, lastDisconnect } = update;
         if (connection === 'open') {
             console.log('Bot connected successfully!');
+        } else if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Connection closed. Reconnecting...', shouldReconnect);
+            if (shouldReconnect) startBot();
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
-        if (!msg.message || msg.key.fromMe) {
-            // If owner replied manually, mute the bot for this chat
-            if (msg.key.fromMe && msg.key.remoteJid) {
-                manualMutes.set(msg.key.remoteJid, Date.now());
+        if (!msg.message) return;
+
+        const sender = msg.key.remoteJid;
+
+        // If the owner replies manually in WhatsApp, pause the bot for this chat
+        if (msg.key.fromMe) {
+            if (sender) {
+                manualMutes.set(sender, Date.now());
             }
             return;
         }
 
-        const sender = msg.key.remoteJid;
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
 
-        // Check if owner recently took over manually
+        // Check if bot is currently muted due to owner taking over
         const lastMuted = manualMutes.get(sender) || 0;
         if (Date.now() - lastMuted < MUTE_DURATION) {
-            return; // Bot stays stepped down while owner is handling it
+            return;
         }
 
-        // Check for manual handover triggers from customer
-        if (text.toLowerCase().includes('owner') || text.toLowerCase().includes('human')) {
+        // Check for human handover triggers from customer
+        if (text.toLowerCase().includes('owner') || text.toLowerCase().includes('human') || text.toLowerCase().includes('talk to someone')) {
             manualMutes.set(sender, Date.now() + (2 * 60 * 60 * 1000)); // Mute for 2 hours
             await sock.sendMessage(sender, { text: "I've connected you with the owner. Someone from our team will be with you shortly." });
             return;
         }
 
-        // Send typing indicator and generate natural response
+        // Simulate typing delay (2.5 seconds) so it feels natural and avoids WhatsApp spam triggers
         await sock.sendPresenceUpdate('composing', sender);
+        await delay(2500);
+
+        // Generate response using Gemini / Nvidia / Keywords
         const replyText = await generateAIResponse(sender, text);
         
         await sock.sendMessage(sender, { text: replyText });
