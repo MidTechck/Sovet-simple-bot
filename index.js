@@ -1,46 +1,43 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
 
 // --- RAILWAY PERSISTENT STORAGE ---
-// This ensures you don't have to scan the QR code every time Railway restarts
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data';
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
-
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 // --- WEB SERVER FOR QR CODE ---
 const app = express();
 const PORT = process.env.PORT || 8080;
 let qrCodeDataUrl = '';
 let isConnected = false;
+let currentSock = null;
 
 app.get('/', (req, res) => {
     if (isConnected) {
-        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px; color: green;">Bot is successfully connected to WhatsApp.</h2><p style="text-align: center;">The AI is currently active and monitoring messages.</p>');
+        return res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 20vh; color: green;">Bot is successfully connected to WhatsApp!</h2>');
     } else if (qrCodeDataUrl) {
-        res.send(`
+        return res.send(`
             <html>
-            <head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-            <body style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
+            <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="10"></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; margin-top: 10vh;">
                 <h2>Scan this QR Code with WhatsApp</h2>
                 <p>Open WhatsApp > Linked Devices > Link a Device</p>
-                <img src="${qrCodeDataUrl}" alt="WhatsApp QR Code" style="max-width: 300px; height: auto;" />
-                <p style="color: gray; font-size: 12px;">This page refreshes automatically...</p>
-                <script>setTimeout(() => location.reload(), 5000);</script>
+                <img src="${qrCodeDataUrl}" alt="WhatsApp QR Code" style="max-width: 300px; height: auto; border: 3px solid #25D366; border-radius: 12px; padding: 10px;" />
+                <p style="color: gray; font-size: 14px;">This page refreshes automatically to keep the session alive...</p>
             </body>
             </html>
         `);
     } else {
-        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px;">Starting bot...</h2><p style="text-align: center;">Please refresh this page in a few seconds to see the QR code.</p>');
+        return res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 20vh;">Starting bot and generating QR code... Please wait.</h2><script>setTimeout(() => location.reload(), 3000);</script>');
     }
 });
 
@@ -49,24 +46,24 @@ app.listen(PORT, () => {
 });
 
 // --- BOT STATE & MEMORY ---
-const manualMutes = new Map(); 
-const MUTE_DURATION = 45 * 60 * 1000; 
-const chatHistories = new Map(); 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const manualMutes = new Map(); // Tracks muted conversations: remoteJid -> timestamp
+const MUTE_DURATION = 45 * 60 * 1000; // 45 minutes
+const chatHistories = new Map(); // Tracks history for AI: remoteJid -> array
 
-// --- AI GENERATION WITH MULTI-TIER FALLBACK ---
+// --- AI GENERATION ENGINE ---
 async function generateAIResponse(senderNumber, userMessage) {
     if (!chatHistories.has(senderNumber)) chatHistories.set(senderNumber, []);
     const history = chatHistories.get(senderNumber);
     
     history.push({ role: 'user', content: userMessage });
-    if (history.length > 6) history.shift();
+    if (history.length > 6) history.shift(); // Keep only the last 6 messages
 
     const systemPrompt = `You are a friendly, concise human representative for Trustwave Technologies Ltd on WhatsApp. 
 Keep your responses short, natural, direct, and conversational (1-2 sentences max). 
 Never use robotic corporate intros like "Hello, I am the assistant for...". Talk like a real person typing quickly on a phone.
 If you don't know an exact price for a custom installation, say: "I can have our team calculate a quote for your setup and get back to you shortly."
-Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.`;
+Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.
+STRICT RULE: Never use exclamation marks or emojis.`;
 
     // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
@@ -89,11 +86,11 @@ Services provided: CCTV cameras, access control systems, IT security services, a
                 return reply.trim();
             }
         } catch (err) {
-            console.log('Gemini API failed, falling back to Nvidia...');
+            console.log('Gemini API failed, attempting Nvidia fallback...');
         }
     }
 
-    // 2. SECONDARY BACKUP: NVIDIA API
+    // 2. SECONDARY: NVIDIA API
     if (NVIDIA_API_KEY) {
         try {
             const nvidiaMessages = [
@@ -105,7 +102,7 @@ Services provided: CCTV cameras, access control systems, IT security services, a
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${NVIDIA_API_KEY}`
+                    'Authorization': `Bearer ${NVIDIA_API_KEY.trim()}`
                 },
                 body: JSON.stringify({
                     model: 'nvidia/nemotron-4-34b-instruct',
@@ -122,35 +119,44 @@ Services provided: CCTV cameras, access control systems, IT security services, a
                 return reply.trim();
             }
         } catch (err) {
-            console.log('Nvidia API failed, falling back to keywords...');
+            console.log('Nvidia API failed, triggering local keywords...');
         }
     }
 
-    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS (Strictly No Exclamation Marks)
+    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS (Strictly No Emojis or Exclamation Marks)
     const lower = userMessage.toLowerCase();
-    if (lower.includes('cctv') || lower.includes('camera')) {
-        return "We install HD CCTV cameras with remote phone viewing. Want a quick quote?";
-    } else if (lower.includes('starlink') || lower.includes('internet')) {
-        return "We do full Starlink installations and network extensions. Are you looking to set up a new dish?";
-    } else if (lower.includes('price') || lower.includes('cost')) {
-        return "Our pricing depends on your exact setup. Would you like a technician to assess your site?";
-    } else if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
-        return "Hello there. How can we help you with your security or IT systems today?";
+    if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
+        return "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
+    } else if (lower.includes('starlink') || lower.includes('internet') || lower.includes('wifi')) {
+        return "We do full Starlink installations and network extensions. Are you looking to set up a new dish.";
+    } else if (lower.includes('price') || lower.includes('cost') || lower.includes('how much')) {
+        return "Our pricing depends on your exact setup. Would you like a technician to assess your site.";
+    } else if (lower.includes('hello') || lower.includes('hi') || lower.includes('morning') || lower.includes('afternoon')) {
+        return "Hello there. How can we help you with your security or IT systems today.";
     }
 
-    return "Thanks for reaching out. Let me connect you with the owner to assist you further.";
+    return "Thanks for reaching out. Let me connect you with our team to assist you further.";
 }
 
 // --- WHATSAPP BOT CORE ---
 async function startBot() {
-    // Uses the persistent AUTH_DIR so Railway remembers the session on restart
+    if (currentSock) {
+        try { currentSock.end(undefined); } catch (e) {}
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    
+    const { version } = await fetchLatestBaileysVersion();
+
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false, 
-        logger: pino({ level: 'silent' })
+        version,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false
     });
+
+    currentSock = sock;
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -161,24 +167,30 @@ async function startBot() {
             qrcode.toDataURL(qr, (err, url) => {
                 if (!err) {
                     qrCodeDataUrl = url;
-                    console.log('New QR code generated. Check your web URL to scan.');
+                    console.log('New QR code generated successfully.');
                 }
             });
         }
 
         if (connection === 'open') {
-            console.log('Bot connected successfully.');
+            console.log('Bot connected to WhatsApp successfully.');
             isConnected = true;
-            qrCodeDataUrl = ''; // Clear the QR code once connected
+            qrCodeDataUrl = '';
         } else if (connection === 'close') {
             isConnected = false;
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed. Reconnecting...', shouldReconnect);
-            if (shouldReconnect) {
-                setTimeout(startBot, 3000); // Wait 3 seconds before reconnecting
-            } else {
-                console.log('Logged out. Please delete the auth folder and rescan.');
+            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            console.log('Connection closed. Status code:', statusCode);
+
+            // If logged out or session invalidated, delete auth folder to force re-scan
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
+                console.log('Session invalidated. Clearing auth state...');
+                try {
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                } catch (e) {}
             }
+            
+            console.log('Attempting to reconnect in 4 seconds...');
+            setTimeout(startBot, 4000);
         }
     });
 
@@ -188,32 +200,45 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
-        // Handle messages sent by you (the owner) to mute the bot
+        // OWNER TAKEOVER: If you send a message, mute the bot for THIS specific client for 45 mins.
         if (msg.key.fromMe) {
-            if (sender) manualMutes.set(sender, Date.now());
+            if (sender) {
+                manualMutes.set(sender, Date.now());
+                console.log(`Human agent replied to ${sender}. Bot muted for this client for 45 minutes.`);
+            }
             return;
         }
 
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
 
-        // Check if the conversation is manually muted
+        // Check if this specific client is currently muted
         const lastMuted = manualMutes.get(sender) || 0;
-        if (Date.now() - lastMuted < MUTE_DURATION) return;
+        if (Date.now() - lastMuted < MUTE_DURATION) {
+            return; // Silently ignore the message
+        }
 
-        // Check for human handover trigger
-        if (text.toLowerCase().includes('owner') || text.toLowerCase().includes('human') || text.toLowerCase().includes('talk to someone')) {
-            manualMutes.set(sender, Date.now() + (2 * 60 * 60 * 1000)); // Mute for 2 hours
+        // CLIENT REQUESTS HUMAN: Mute this client for 45 mins and send handover message.
+        const lowerText = text.toLowerCase();
+        if (lowerText.includes('owner') || lowerText.includes('human') || lowerText.includes('talk to someone')) {
+            manualMutes.set(sender, Date.now()); 
             await sock.sendMessage(sender, { text: "I have connected you with the owner. Someone from our team will be with you shortly." });
             return;
         }
 
-        // Simulate typing delay for realism
-        await sock.sendPresenceUpdate('composing', sender);
-        await delay(2500);
+        console.log(`Received message from ${sender}: "${text}"`);
 
-        // Generate and send AI response
+        // Typing animation & natural delay
+        await sock.sendPresenceUpdate('composing', sender);
+        
+        // Process AI Response
         const replyText = await generateAIResponse(sender, text);
+        
+        // Calculate typing time based on length of response (min 1.5s, max 4s)
+        const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
+        await new Promise(resolve => setTimeout(resolve, typingDelay));
+        
+        await sock.sendPresenceUpdate('paused', sender);
         await sock.sendMessage(sender, { text: replyText });
     });
 }
