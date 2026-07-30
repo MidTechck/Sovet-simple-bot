@@ -5,9 +5,19 @@ const pino = require('pino');
 const express = require('express');
 const qrcode = require('qrcode');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// Persistent storage configuration for Railway volumes
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data';
+const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
+const CHATS_DIR = path.join(DATA_DIR, 'chats');
+const LEADS_FILE = path.join(DATA_DIR, 'leads.txt');
+
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR, { recursive: true });
 
 let qrCodeData = '';
 let isConnected = false;
@@ -15,7 +25,7 @@ let currentSock = null;
 
 const userSessions = {};
 
-// Expanded response pools designed with natural, human-like phrasing. Strictly NO emojis and NO exclamation marks (!)
+// Expanded response pools with strictly NO emojis and NO exclamation marks (!)
 const responsePools = {
     location: [
         "We are based in Lusaka Woodlands and Ndola, and we serve clients across Zambia. Would you like us to check coverage for your specific location.",
@@ -26,11 +36,6 @@ const responsePools = {
         "We operate from Monday to Sunday between 08:00 and 18:00. Are you looking to schedule a visit during these hours.",
         "Our team is available every day of the week from 08:00 to 18:00. Let me know what time works best for your schedule.",
         "We are open Monday through Sunday, 08:00 to 18:00 daily. Do you need assistance right now or for a future date."
-    ],
-    night_active: [
-        "I notice you are messaging late at night. Our technical desk is closed until morning, but I have saved your details and our team will review it first thing at 08:00.",
-        "Thanks for reaching out during the night hours. While our physical offices are offline, your inquiry is logged and a team member will address it in the morning.",
-        "It is past our normal operating hours, but your message has been recorded safely. We will get back to you as soon as business hours resume."
     ],
     starlink_price: [
         "Starlink Gen 3 starts from K9,000 and Starlink Mini starts from K6,800. Would you like details on monthly data packages as well.",
@@ -112,6 +117,30 @@ const responsePools = {
         "We provide detailed quotations after gathering your project specifications. Tell me a bit about your property or business needs.",
         "Our team prepares customized quotes based on your exact site requirements. What specific services are you budgeting for."
     ],
+    speed_test: [
+        "If you are checking internet speeds, connecting directly via ethernet or standing close to the router helps get accurate readings. What speeds are you currently getting.",
+        "We can guide you on running proper throughput tests on your Starlink or network connection. Let me know what download speeds register on your end."
+    ],
+    router_setup: [
+        "We configure enterprise routers, access points, and mesh Wi-Fi systems for seamless coverage. What model of router are you using.",
+        "Our engineers handle complete router and switch configurations for homes and offices. Do you need VLANs or guest networks set up."
+    ],
+    cable_repair: [
+        "We offer professional cable repair, fiber splicing, and structured cabling re-termination. Where is the cable fault located.",
+        "Damaged cables can severely degrade your network performance. Would you like our technicians to inspect and replace the faulty lines."
+    ],
+    wireless_bridge: [
+        "We install long-range wireless bridges to connect multiple buildings or distant cameras without trenching. What distance do you need to bridge.",
+        "Point-to-point wireless link setups are ideal for extending network coverage across properties. Tell me about the layout between your structures."
+    ],
+    power_backup: [
+        "We supply and install UPS units and solar inverter power backups to keep your Starlink and CCTV running during power cuts. What is your power backup requirement.",
+        "Uninterrupted power systems protect your security and internet infrastructure. Do you need backup power for just your router or your entire office."
+    ],
+    site_survey: [
+        "Our team conducts physical site surveys to determine optimal dish placement and network coverage paths. Would you like to book a survey visit.",
+        "A site survey ensures your installation is optimized for signal strength and security. When would you want our technicians to inspect your property."
+    ],
     morning: [
         "Good morning. How can I assist you with your inquiry today.",
         "Morning. What can I help you with right now.",
@@ -142,6 +171,11 @@ const responsePools = {
         "Take care. Feel free to reach out whenever you need assistance.",
         "Bye for now. Have a wonderful day."
     ],
+    apology: [
+        "No need to apologize at all. How can I assist you further with your project.",
+        "That is completely fine. What else can our team help you with today.",
+        "No worries at all. Let me know how we can proceed."
+    ],
     company_info: [
         "We are Sovet Link Technologies, providing reliable IT infrastructure, Starlink internet, and CCTV solutions in Zambia. Would you like to know more about a specific service.",
         "Sovet Link Technologies specializes in professional networking, security systems, and high-speed Starlink setups. How can our team help you today.",
@@ -152,30 +186,10 @@ const responsePools = {
         "Our direct line is +260 968 252 812. Feel free to give us a call whenever you are ready.",
         "You can call our support desk at +260 968 252 812 or chat with us right here. How else can we assist you."
     ],
-    client_type: [
-        "We cater to both residential homes and commercial businesses, including offices and schools. Is this inquiry for your home or business premises.",
-        "Our installation teams handle projects of all sizes, from private homes to corporate buildings. What type of property are you setting up.",
-        "We provide tailored IT and security solutions for both domestic and corporate clients. Let me know your specific requirements."
-    ],
     warranty: [
         "We assist with hardware troubleshooting and warranty support for installed systems. What specific equipment is giving you trouble.",
         "If you encounter any faulty hardware we supplied, our team will inspect and guide you on the replacement process. Can you describe the issue.",
         "We provide support for equipment maintenance and repairs. Let us know what component needs attention."
-    ],
-    custom_order: [
-        "We handle custom IT infrastructure and specialized connectivity setups tailored to unique project needs. What specifications are you looking for.",
-        "Our engineers can design custom solutions for complex sites or multi-building setups. Would you like to discuss your project details with us.",
-        "We accommodate special technical requests for both corporate and residential clients. Tell us more about what you need built."
-    ],
-    question_prompt: [
-        "I am ready to help. What specific service or information would you like to know about.",
-        "Go ahead and share your question, and I will get you the right information.",
-        "I am here to assist. What is your question regarding our services."
-    ],
-    bot_check: [
-        "I am an automated assistant helping handle inquiries for Sovet Link Technologies, but our human technical team is always close by. What can we help you with.",
-        "I handle initial client inquiries here on WhatsApp, and our human technical team steps in for technical details and bookings. How can we assist you today.",
-        "I am a virtual assistant supporting the Sovet Link team. What service information can I pull up for you."
     ],
     urgent: [
         "For urgent technical assistance or network outages, please call our team directly at +260 968 252 812 so we can prioritize your request.",
@@ -195,20 +209,36 @@ function getRandomReply(category) {
     return pool[randomIndex];
 }
 
-function getTimeBasedGreeting() {
-    const hour = new Date().getHours();
-    if (hour >= 0 && hour < 5) return getRandomReply('night_active');
-    if (hour < 12) return getRandomReply('morning');
-    if (hour < 17) return getRandomReply('afternoon');
-    return getRandomReply('evening');
+// Exact character-length based typing delay calculation
+function getTypingDelay(text) {
+    const len = text.length;
+    if (len < 60) {
+        return Math.floor((Math.random() * 0.3 + 1.5) * 1000);
+    } else if (len <= 140) {
+        return Math.floor((Math.random() * 0.2 + 1.9) * 1000);
+    } else {
+        return Math.floor((Math.random() * 0.1 + 2.2) * 1000);
+    }
+}
+
+// File-based persistent conversation memory per client
+function appendClientHistory(cleanNumber, role, messageText) {
+    const filePath = path.join(CHATS_DIR, `${cleanNumber}.txt`);
+    const timestamp = new Date().toLocaleString();
+    const entry = `[${timestamp}] ${role.toUpperCase()}: "${messageText}"\n`;
+    try {
+        fs.appendFileSync(filePath, entry);
+    } catch (err) {
+        console.log('Failed to write client history file:', err);
+    }
 }
 
 function logLead(sender, text, replyText) {
     const timestamp = new Date().toLocaleString();
-    const cleanNumber = sender.replace('@s.whatsapp.net', '');
+    const cleanNumber = sender.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
     const logEntry = `----------------------------------------\n[${timestamp}] Client: +${cleanNumber}\nMessage: "${text}"\nBot Reply: "${replyText}"\n`;
     try {
-        fs.appendFileSync('leads.txt', logEntry + '\n');
+        fs.appendFileSync(LEADS_FILE, logEntry + '\n');
     } catch (err) {
         console.log('Failed to write lead to file:', err);
     }
@@ -216,134 +246,127 @@ function logLead(sender, text, replyText) {
 
 function processMessage(sender, text) {
     const lower = text.toLowerCase();
-    const currentHour = new Date().getHours();
-    const isNightTime = currentHour >= 0 && currentHour < 5;
 
     if (!userSessions[sender]) {
-        userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0 };
+        userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0, lastCategory: null };
     }
     userSessions[sender].messageCount += 1;
 
-    // If it is late night (00:00 to 05:00), route standard initial inquiries to night_active mode
-    if (isNightTime && userSessions[sender].firstContact && !lower.includes('urgent') && !lower.includes('emergency')) {
-        userSessions[sender].firstContact = false;
-        return getRandomReply('night_active');
-    }
+    let matchedCategory = 'fallback';
 
-    // 1. Payment / Buying safeguard
-    if (lower.includes('pay') || lower.includes('buy') || lower.includes('deposit') || lower.includes('transfer') || lower.includes('send money') || lower.includes('paid') || lower.includes('bank') || lower.includes('momo') || lower.includes('airtel money')) {
-        return getRandomReply('payment');
+    // 1. Apologies handling
+    if (lower.includes('sorry') || lower.includes('apologize') || lower.includes('apologies') || lower.includes('pardon')) {
+        matchedCategory = 'apology';
     }
-
-    // 2. Urgent / Emergency
-    if (lower.includes('urgent') || lower.includes('emergency') || lower.includes('asap') || lower.includes('immediately') || lower.includes('down')) {
-        return getRandomReply('urgent');
+    // 2. Payment / Buying safeguard
+    else if (lower.includes('pay') || lower.includes('buy') || lower.includes('deposit') || lower.includes('transfer') || lower.includes('send money') || lower.includes('paid') || lower.includes('bank') || lower.includes('momo') || lower.includes('airtel money')) {
+        matchedCategory = 'payment';
     }
+    // 3. Urgent / Emergency
+    else if (lower.includes('urgent') || lower.includes('emergency') || lower.includes('asap') || lower.includes('immediately') || lower.includes('down') || lower.includes('outage')) {
+        matchedCategory = 'urgent';
+    }
+    // 4. Greetings
+    else if (lower.includes('morning')) matchedCategory = 'morning';
+    else if (lower.includes('afternoon')) matchedCategory = 'afternoon';
+    else if (lower.includes('evening')) matchedCategory = 'evening';
+    else if (lower.includes('hi') || lower.includes('hello') || lower.includes('hey') || lower.includes('greetings') || lower.includes('how are you')) {
+        matchedCategory = 'general_greeting';
+    }
+    // 5. Thanks & Farewell
+    else if (lower.includes('thank') || lower.includes('thx') || lower.includes('appreciate')) {
+        matchedCategory = 'thanks';
+    }
+    else if (lower.includes('bye') || lower.includes('goodbye') || lower.includes('see you') || lower.includes('later')) {
+        matchedCategory = 'farewell';
+    }
+    // 6. Bot check / Human check
+    else if (lower.includes('bot') || lower.includes('robot') || lower.includes('real person') || lower.includes('human')) {
+        matchedCategory = 'bot_check';
+    }
+    // 7. Decision-making & Contextual Affirmation/Negation (Yes / No / Maybe handling based on memory)
+    else if (['yes', 'yeah', 'yep', 'sure', 'okay', 'ok', 'yup', 'definitely', 'proceed', 'please do'].some(word => lower === word || lower.startsWith(word + ' '))) {
+        const lastCat = userSessions[sender].lastCategory;
+        if (lastCat === 'starlink_price') matchedCategory = 'starlink_install';
+        else if (lastCat === 'cctv_price') matchedCategory = 'booking';
+        else if (lastCat === 'site_survey') matchedCategory = 'booking';
+        else if (lastCat === 'location') matchedCategory = 'starlink_price';
+        else matchedCategory = 'question_prompt';
+    }
+    else if (['no', 'nope', 'nah', 'not really', "don't"].some(word => lower === word || lower.startsWith(word + ' '))) {
+        matchedCategory = 'fallback';
+    }
+    else if (['maybe', 'perhaps', 'not sure', 'possibly'].some(word => lower.includes(word))) {
+        matchedCategory = 'question_prompt';
+    }
+  // 8. Technical, Stock, Quote & Troubleshooting keywords
+    else if (lower.includes('question') || lower.includes('ask')) matchedCategory = 'question_prompt';
+    else if (lower.includes('stock') || lower.includes('available') || lower.includes('have you got') || lower.includes('in store') || lower.includes('inventory')) matchedCategory = 'hardware_availability';
+    else if (lower.includes('quote') || lower.includes('quotation') || lower.includes('estimate') || lower.includes('pricing')) matchedCategory = 'quote_request';
+    else if (lower.includes('slow') || lower.includes('disconnect') || lower.includes('router') || lower.includes('signal') || lower.includes('wifi')) matchedCategory = 'wifi_troubleshoot';
+    else if (lower.includes('speed') || lower.includes('mbps') || lower.includes('throughput') || lower.includes('bandwidth')) matchedCategory = 'speed_test';
+    else if (lower.includes('configure') || lower.includes('access point') || lower.includes('mesh')) matchedCategory = 'router_setup';
+    else if (lower.includes('cable') || lower.includes('fiber') || lower.includes('splice') || lower.includes('wire')) matchedCategory = 'cable_repair';
+    else if (lower.includes('bridge') || lower.includes('point to point') || lower.includes('link buildings')) matchedCategory = 'wireless_bridge';
+    else if (lower.includes('ups') || lower.includes('solar') || lower.includes('backup power') || lower.includes('battery')) matchedCategory = 'power_backup';
+    else if (lower.includes('survey') || lower.includes('site visit') || lower.includes('inspection')) matchedCategory = 'site_survey';
+    // 9. Location & Coverage
+    else if (lower.includes('where') || lower.includes('location') || lower.includes('office') || lower.includes('branch') || lower.includes('lusaka') || lower.includes('ndola') || lower.includes('cover') || lower.includes('province')) {
+        matchedCategory = 'location';
+    }
+    // 10. Hours
+    else if (lower.includes('hour') || lower.includes('time') || lower.includes('open') || lower.includes('close') || lower.includes('working') || lower.includes('sunday')) {
+        matchedCategory = 'hours';
+    }
+    // 11. Phone / Call contact
+    else if (lower.includes('phone') || lower.includes('call') || lower.includes('speak') || lower.includes('number')) {
+        matchedCategory = 'phone_contact';
+    }
+    // 12. Booking
+    else if (lower.includes('book') || lower.includes('schedule') || lower.includes('appointment') || lower.includes('consultation')) {
+        matchedCategory = 'booking';
+    }
+    // 13. Company info
+    else if (lower.includes('company') || lower.includes('about') || lower.includes('sovet') || lower.includes('what do you do')) {
+        matchedCategory = 'company_info';
+    }
+    else {
+        // Multi-topic service parsing
+        const asksPrice = lower.includes('price') || lower.includes('cost') || lower.includes('how much') || lower.includes('fee') || lower.includes('rates') || lower.includes('k9') || lower.includes('k8') || lower.includes('k6');
+        const mentionsStarlink = lower.includes('starlink') || lower.includes('dish') || lower.includes('internet');
+        const mentionsCCTV = lower.includes('cctv') || lower.includes('camera') || lower.includes('security') || lower.includes('surveillance');
+        const mentionsNetwork = lower.includes('network') || lower.includes('cabling') || lower.includes('lan') || lower.includes('it support');
+        const mentionsMonthly = lower.includes('monthly') || lower.includes('subscription') || lower.includes('data plan') || lower.includes('k800');
+        const mentionsInstall = lower.includes('installation') || lower.includes('install') || lower.includes('mount') || lower.includes('setup');
+        const mentionsUpgrade = lower.includes('upgrade') || lower.includes('change plan');
+        const mentionsSupport = lower.includes('support after') || lower.includes('warranty') || lower.includes('repair');
+        const mentionsSupply = lower.includes('supply') || lower.includes('only install') || lower.includes('equipment');
 
-    // 3. Greetings
-    if (lower.includes('morning')) return getRandomReply('morning');
-    if (lower.includes('afternoon')) return getRandomReply('afternoon');
-    if (lower.includes('evening')) return getRandomReply('evening');
-    if (lower.includes('hi') || lower.includes('hello') || lower.includes('hey') || lower.includes('greetings') || lower.includes('how are you')) {
-        if (userSessions[sender].firstContact) {
-            userSessions[sender].firstContact = false;
-            return getTimeBasedGreeting();
+        if (mentionsStarlink) {
+            if (mentionsMonthly) matchedCategory = 'starlink_monthly';
+            else if (asksPrice) matchedCategory = 'starlink_price';
+            else if (mentionsInstall) matchedCategory = 'starlink_install';
+            else matchedCategory = 'starlink_price';
+        } else if (mentionsCCTV) {
+            if (lower.includes('phone') || lower.includes('remote') || lower.includes('view')) matchedCategory = 'cctv_phone';
+            else if (asksPrice) matchedCategory = 'cctv_price';
+            else matchedCategory = 'cctv';
+        } else if (mentionsNetwork) {
+            if (lower.includes('it support') || lower.includes('troubleshoot')) matchedCategory = 'it_support';
+            else matchedCategory = 'network';
+        } else if (mentionsUpgrade) {
+            matchedCategory = 'upgrade';
+        } else if (mentionsSupport) {
+            matchedCategory = 'support_after';
+        } else if (mentionsSupply) {
+            matchedCategory = 'supply_install';
         }
-        return getRandomReply('general_greeting');
     }
 
-    // 4. Thanks & Farewell
-    if (lower.includes('thank') || lower.includes('thx') || lower.includes('appreciate')) {
-        return getRandomReply('thanks');
-    }
-    if (lower.includes('bye') || lower.includes('goodbye') || lower.includes('see you') || lower.includes('later')) {
-        return getRandomReply('farewell');
-    }
+    // Save current interaction category into memory state
+    userSessions[sender].lastCategory = matchedCategory;
 
-    // 5. Bot check / Human check
-    if (lower.includes('bot') || lower.includes('robot') || lower.includes('real person') || lower.includes('human')) {
-        return getRandomReply('bot_check');
-    }
-
-    // 6. Question prompt & Quote / Availability requests
-    if (lower.includes('question') || lower.includes('ask')) {
-        return getRandomReply('question_prompt');
-    }
-    if (lower.includes('stock') || lower.includes('available') || lower.includes('have you got') || lower.includes('in store')) {
-        return getRandomReply('hardware_availability');
-    }
-    if (lower.includes('quote') || lower.includes('quotation') || lower.includes('estimate')) {
-        return getRandomReply('quote_request');
-    }
-    if (lower.includes('slow') || lower.includes('disconnect') || lower.includes('router') || lower.includes('signal')) {
-        return getRandomReply('wifi_troubleshoot');
-    }
-
-    // 7. Location & Coverage
-    if (lower.includes('where') || lower.includes('location') || lower.includes('office') || lower.includes('branch') || lower.includes('lusaka') || lower.includes('ndola') || lower.includes('cover') || lower.includes('province')) {
-        return getRandomReply('location');
-    }
-
-    // 8. Hours
-    if (lower.includes('hour') || lower.includes('time') || lower.includes('open') || lower.includes('close') || lower.includes('working') || lower.includes('sunday')) {
-        return getRandomReply('hours');
-    }
-
-    // 9. Phone / Call contact
-    if (lower.includes('phone') || lower.includes('call') || lower.includes('speak') || lower.includes('number')) {
-        return getRandomReply('phone_contact');
-    }
-
-    // 10. Booking
-    if (lower.includes('book') || lower.includes('schedule') || lower.includes('appointment') || lower.includes('consultation') || lower.includes('site visit')) {
-        return getRandomReply('booking');
-    }
-
-    // 11. Company info
-    if (lower.includes('company') || lower.includes('about') || lower.includes('sovet') || lower.includes('what do you do')) {
-        return getRandomReply('company_info');
-    }
-
-      // 12. Multi-topic or specific services (Starlink, CCTV, Network, Pricing checks)
-    const asksPrice = lower.includes('price') || lower.includes('cost') || lower.includes('how much') || lower.includes('fee') || lower.includes('rates') || lower.includes('k9') || lower.includes('k8') || lower.includes('k6');
-    const mentionsStarlink = lower.includes('starlink') || lower.includes('dish') || lower.includes('internet');
-    const mentionsCCTV = lower.includes('cctv') || lower.includes('camera') || lower.includes('security') || lower.includes('surveillance');
-    const mentionsNetwork = lower.includes('network') || lower.includes('cabling') || lower.includes('lan') || lower.includes('wifi') || lower.includes('it support') || lower.includes('router');
-    const mentionsMonthly = lower.includes('monthly') || lower.includes('subscription') || lower.includes('data plan') || lower.includes('k800');
-    const mentionsInstall = lower.includes('installation') || lower.includes('install') || lower.includes('mount') || lower.includes('setup');
-    const mentionsUpgrade = lower.includes('upgrade') || lower.includes('change plan');
-    const mentionsSupport = lower.includes('support after') || lower.includes('warranty') || lower.includes('repair');
-    const mentionsSupply = lower.includes('supply') || lower.includes('only install') || lower.includes('equipment');
-
-    let replies = [];
-
-    if (mentionsStarlink) {
-        if (mentionsMonthly) replies.push(getRandomReply('starlink_monthly'));
-        else if (asksPrice) replies.push(getRandomReply('starlink_price'));
-        else if (mentionsInstall) replies.push(getRandomReply('starlink_install'));
-        else replies.push(getRandomReply('starlink_price'));
-    }
-
-    if (mentionsCCTV) {
-        if (lower.includes('phone') || lower.includes('remote') || lower.includes('view')) replies.push(getRandomReply('cctv_phone'));
-        else if (asksPrice) replies.push(getRandomReply('cctv_price'));
-        else replies.push(getRandomReply('cctv'));
-    }
-
-    if (mentionsNetwork) {
-        if (lower.includes('it support') || lower.includes('troubleshoot')) replies.push(getRandomReply('it_support'));
-        else replies.push(getRandomReply('network'));
-    }
-
-    if (mentionsUpgrade) replies.push(getRandomReply('upgrade'));
-    if (mentionsSupport) replies.push(getRandomReply('support_after'));
-    if (mentionsSupply) replies.push(getRandomReply('supply_install'));
-
-    if (replies.length > 0) {
-        return replies.join(" ");
-    }
-
-    return getRandomReply('fallback');
+    return getRandomReply(matchedCategory);
 }
 
 async function startBot() {
@@ -351,7 +374,7 @@ async function startBot() {
         try { currentSock.end(undefined); } catch (e) {}
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -386,7 +409,7 @@ async function startBot() {
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
                 console.log('Session invalidated. Clearing auth state...');
                 try {
-                    fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 } catch (e) {}
             }
             
@@ -401,35 +424,41 @@ async function startBot() {
         if (!msg.message) return;
 
         const sender = msg.key.remoteJid;
+        const cleanNumber = sender.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
 
         if (!userSessions[sender]) {
-            userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0 };
+            userSessions[sender] = { messageCount: 0, firstContact: true, pausedUntil: 0, lastCategory: null };
         }
 
-        // HUMAN TAKEOVER GUARD: Extended to 1 HOUR (60 minutes) if you or your team reply manually.
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+
+        // ISOLATED HUMAN TAKEOVER GUARD: Mutes ONLY this specific client chat for 45 minutes
         if (msg.key.fromMe) {
-            userSessions[sender].pausedUntil = Date.now() + (60 * 60 * 1000);
-            console.log(`Human agent active in chat ${sender}. Bot paused for 1 hour.`);
+            userSessions[sender].pausedUntil = Date.now() + (45 * 60 * 1000);
+            console.log(`Human agent active in chat ${sender}. Bot paused for this client for 45 minutes.`);
+            if (text) appendClientHistory(cleanNumber, 'agent', text);
             return;
         }
 
         if (userSessions[sender].pausedUntil > Date.now()) {
             console.log(`Bot is currently muted for ${sender} due to active human conversation.`);
+            if (text) appendClientHistory(cleanNumber, 'client', text);
             return;
         }
 
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         if (!text) return;
 
         console.log(`Received message from ${sender}: "${text}"`);
+        appendClientHistory(cleanNumber, 'client', text);
         
         await sock.sendPresenceUpdate('composing', sender);
 
         const replyText = processMessage(sender, text);
         
         logLead(sender, text, replyText);
+        appendClientHistory(cleanNumber, 'bot', replyText);
 
-        const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
+        const typingDelay = getTypingDelay(replyText);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
         await sock.sendPresenceUpdate('paused', sender);
@@ -439,7 +468,7 @@ async function startBot() {
 
 app.get('/', async (req, res) => {
     if (isConnected) {
-        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is successfully connected to WhatsApp!</h1>');
+        return res.send('<h1 style="color:green; text-align:center; margin-top:20vh; font-family:sans-serif;">Bot is successfully connected to WhatsApp with persistent storage and contextual memory!</h1>');
     }
     if (!qrCodeData) {
         return res.send(`
@@ -462,7 +491,7 @@ app.get('/', async (req, res) => {
                 <p>Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>
                 <img src="${url}" alt="WhatsApp QR Code" style="width:300px; height:300px; border:3px solid #25D366; border-radius:12px; padding:10px; background:white;" />
                 <p style="color:gray; font-size:14px; margin-top:15px;">Page auto-refreshes to keep your QR session active.</p>
-            /body>
+            </body>
             </html>
         `);
     } catch (err) {
