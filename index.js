@@ -32,7 +32,7 @@ app.get('/', (req, res) => {
                 <h2>Scan this QR Code with WhatsApp</h2>
                 <p>Open WhatsApp > Linked Devices > Link a Device</p>
                 <img src="${qrCodeDataUrl}" alt="WhatsApp QR Code" style="max-width: 300px; height: auto; border: 3px solid #25D366; border-radius: 12px; padding: 10px;" />
-                <p style="color: gray; font-size: 14px;">This page refreshes automatically to keep the session alive...</p>
+                <p style="color: gray; font-size: 14px;">This page refreshes automatically...</p>
             </body>
             </html>
         `);
@@ -42,7 +42,7 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Web server running on port ${PORT}. Check your Railway URL to scan the QR code.`);
+    console.log(`Web server running on port ${PORT}.`);
 });
 
 // --- BOT STATE & MEMORY ---
@@ -123,7 +123,7 @@ STRICT RULE: Never use exclamation marks or emojis.`;
         }
     }
 
-    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS (Strictly No Emojis or Exclamation Marks)
+    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
     if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
         return "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
@@ -181,15 +181,9 @@ async function startBot() {
             const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log('Connection closed. Status code:', statusCode);
 
-            // If logged out or session invalidated, delete auth folder to force re-scan
             if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
-                console.log('Session invalidated. Clearing auth state...');
-                try {
-                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                } catch (e) {}
+                try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
             }
-            
-            console.log('Attempting to reconnect in 4 seconds...');
             setTimeout(startBot, 4000);
         }
     });
@@ -212,10 +206,10 @@ async function startBot() {
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
 
-        // Check if this specific client is currently muted
+        // Check if this specific client is currently muted by owner takeover
         const lastMuted = manualMutes.get(sender) || 0;
         if (Date.now() - lastMuted < MUTE_DURATION) {
-            return; // Silently ignore the message
+            return; // Silently ignore the message for this client because human took over
         }
 
         // CLIENT REQUESTS HUMAN: Mute this client for 45 mins and send handover message.
@@ -228,13 +222,10 @@ async function startBot() {
 
         console.log(`Received message from ${sender}: "${text}"`);
 
-        // Typing animation & natural delay
         await sock.sendPresenceUpdate('composing', sender);
         
-        // Process AI Response
         const replyText = await generateAIResponse(sender, text);
         
-        // Calculate typing time based on length of response (min 1.5s, max 4s)
         const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
