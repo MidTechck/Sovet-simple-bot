@@ -6,13 +6,17 @@ const express = require('express');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ? process.env.NVIDIA_API_KEY.trim() : "";
+const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER ? process.env.OWNER_NOTIFY_NUMBER.trim() : "";
 
 // --- RAILWAY PERSISTENT STORAGE ---
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
+const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
+const LEADS_FILE = path.join(DATA_DIR, 'leads.log');
 
 // --- WEB SERVER FOR QR CODE ---
 const app = express();
@@ -49,7 +53,107 @@ app.listen(PORT, () => {
 const manualMutes = new Map();
 const MUTE_DURATION = 45 * 60 * 1000;
 const chatHistories = new Map();
-const botMessageIds = new Set();
+const botMessageIds = new Set(); // Tracks messages sent by the bot itself to prevent self-muting
+const lastLeadAlert = new Map();
+const LEAD_ALERT_COOLDOWN = 2 * 60 * 60 * 1000; // don't re-ping the owner about the same client more than once every 2 hours
+
+// Generates our own WhatsApp-style message ID so we can register it as
+// "ours" BEFORE the message is ever sent. This closes the race condition
+// where Baileys echoes our own outgoing message back through
+// messages.upsert before our code got around to marking it as bot-sent
+// (which was causing the bot to mute itself after every auto-reply).
+function generateMessageID() {
+    return crypto.randomBytes(16).toString('hex').toUpperCase();
+}
+
+async function sendTrackedMessage(sock, jid, content) {
+    const messageId = generateMessageID();
+    botMessageIds.add(messageId);
+    if (botMessageIds.size > 300) {
+        const firstKey = botMessageIds.values().next().value;
+        botMessageIds.delete(firstKey);
+    }
+    return sock.sendMessage(jid, content, { messageId });
+}
+
+// --- STATE PERSISTENCE (survives Railway restarts/redeploys) ---
+function loadState() {
+    try {
+        const raw = fs.readFileSync(STATE_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed.chatHistories) {
+            for (const [key, value] of Object.entries(parsed.chatHistories)) {
+                chatHistories.set(key, value);
+            }
+        }
+        if (parsed.manualMutes) {
+            for (const [key, value] of Object.entries(parsed.manualMutes)) {
+                manualMutes.set(key, value);
+            }
+        }
+        console.log(`Restored state for ${chatHistories.size} chat(s) from disk.`);
+    } catch (e) {
+        console.log('No previous state file found, starting fresh.');
+    }
+}
+
+function saveState() {
+    try {
+        const data = {
+            chatHistories: Object.fromEntries(chatHistories),
+            manualMutes: Object.fromEntries(manualMutes)
+        };
+        fs.writeFileSync(STATE_FILE, JSON.stringify(data));
+    } catch (e) {
+        console.log('[STATE SAVE ERROR]:', e.message);
+    }
+}
+
+loadState();
+
+// --- BUYING INTENT DETECTION ---
+// Flags messages that sound like a real customer ready to spend money,
+// logs every one of them to disk, and pings the business owner directly
+// so a hot lead never just sits unnoticed in the AI's queue.
+const BUYING_INTENT_KEYWORDS = [
+    'price', 'cost', 'how much', 'quote', 'quotation',
+    'book', 'order', 'buy', 'purchase', 'interested',
+    'install', 'when can you come', 'available today',
+    'schedule', 'appointment', 'deposit', 'pay'
+];
+
+function logLead(sender, text) {
+    try {
+        const entry = `${new Date().toISOString()} | ${sender.split('@')[0]} | ${text.replace(/\s+/g, ' ')}\n`;
+        fs.appendFileSync(LEADS_FILE, entry);
+    } catch (e) {
+        console.log('[LEAD LOG ERROR]:', e.message);
+    }
+}
+
+async function checkBuyingIntent(sock, sender, text, isMuted) {
+    const lower = text.toLowerCase();
+    const matched = BUYING_INTENT_KEYWORDS.some(k => lower.includes(k));
+    if (!matched) return;
+
+    logLead(sender, text);
+
+    if (isMuted) return; // owner is already handling this client directly, no need to ping again
+    if (!OWNER_NOTIFY_NUMBER) return;
+
+    const lastAlert = lastLeadAlert.get(sender) || 0;
+    if (Date.now() - lastAlert < LEAD_ALERT_COOLDOWN) return;
+    lastLeadAlert.set(sender, Date.now());
+
+    const clientNumber = sender.split('@')[0];
+    const alertText = `New potential sale\nClient: ${clientNumber}\nMessage: "${text}"\n\nReply in their chat directly to take over.`;
+
+    try {
+        await sendTrackedMessage(sock, OWNER_NOTIFY_NUMBER, { text: alertText });
+    } catch (e) {
+        console.log('[OWNER ALERT ERROR]:', e.message);
+    }
+}
 
 // --- AI GENERATION ENGINE ---
 async function generateAIResponse(senderNumber, userMessage) {
@@ -74,23 +178,20 @@ If you don't know an exact price for a custom installation, say: "I can have our
 Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.
 STRICT RULE: Never use exclamation marks or emojis.`;
 
-    // 1. PRIMARY: GEMINI API (Using stable v1 endpoint)
+    // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
         try {
             const geminiPayload = {
-                contents: [
-                    {
-                        role: 'user',
-                        parts: [{ text: `Instructions: ${systemPrompt}` }]
-                    },
-                    ...sanitizedHistory.map(h => ({
-                        role: h.role === 'assistant' ? 'model' : 'user',
-                        parts: [{ text: h.content }]
-                    }))
-                ]
+                system_instruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                contents: sanitizedHistory.map(h => ({
+                    role: h.role === 'assistant' ? 'model' : 'user',
+                    parts: [{ text: h.content }]
+                }))
             };
 
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(geminiPayload)
@@ -116,7 +217,7 @@ STRICT RULE: Never use exclamation marks or emojis.`;
         }
     }
 
-    // 2. SECONDARY: NVIDIA API (Using stable Llama 3.1 model)
+    // 2. SECONDARY: NVIDIA API
     if (NVIDIA_API_KEY) {
         try {
             const nvidiaMessages = [
@@ -231,12 +332,16 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
+        // OWNER TAKEOVER LOGIC
         if (msg.key.fromMe) {
             if (sender && msg.key.id) {
                 if (botMessageIds.has(msg.key.id)) {
+                    // This message was sent by the bot itself, ignore it
                     return;
                 }
+                // This message was manually typed by the human owner from another device/app
                 manualMutes.set(sender, Date.now());
+                saveState();
                 console.log(`Human agent replied manually to ${sender}. Bot muted for this client for 45 minutes.`);
             }
             return;
@@ -245,15 +350,22 @@ async function startBot() {
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
 
+        try { await sock.readMessages([msg.key]); } catch (e) {}
+
         const lastMuted = manualMutes.get(sender) || 0;
-        if (Date.now() - lastMuted < MUTE_DURATION) {
-            return;
+        const isMuted = Date.now() - lastMuted < MUTE_DURATION;
+
+        await checkBuyingIntent(sock, sender, text, isMuted);
+
+        if (isMuted) {
+            return; // Bot is muted for this client because human took over
         }
 
         const lowerText = text.toLowerCase();
         if (lowerText.includes('owner') || lowerText.includes('human') || lowerText.includes('talk to someone')) {
-            manualMutes.set(sender, Date.now()); 
-            await sock.sendMessage(sender, { text: "I have connected you with the owner. Someone from our team will be with you shortly." });
+            manualMutes.set(sender, Date.now());
+            saveState();
+            await sendTrackedMessage(sock, sender, { text: "I have connected you with the owner. Someone from our team will be with you shortly." });
             return;
         }
 
@@ -262,22 +374,14 @@ async function startBot() {
         await sock.sendPresenceUpdate('composing', sender);
         
         const replyText = await generateAIResponse(sender, text);
+        saveState();
         
         const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
         await sock.sendPresenceUpdate('paused', sender);
-        const sentMsg = await sock.sendMessage(sender, { text: replyText });
-
-        if (sentMsg?.key?.id) {
-            botMessageIds.add(sentMsg.key.id);
-            if (botMessageIds.size > 300) {
-                const firstKey = botMessageIds.values().next().value;
-                botMessageIds.delete(firstKey);
-            }
-        }
+        await sendTrackedMessage(sock, sender, { text: replyText });
     });
 }
 
 startBot();
-
