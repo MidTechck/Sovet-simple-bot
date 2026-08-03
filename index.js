@@ -49,6 +49,7 @@ app.listen(PORT, () => {
 const manualMutes = new Map();
 const MUTE_DURATION = 45 * 60 * 1000;
 const chatHistories = new Map();
+const botMessageIds = new Set(); // Tracks messages sent by the bot itself to prevent self-muting
 
 // --- AI GENERATION ENGINE ---
 async function generateAIResponse(senderNumber, userMessage) {
@@ -57,7 +58,6 @@ async function generateAIResponse(senderNumber, userMessage) {
     
     history.push({ role: 'user', content: userMessage });
     
-    // Ensure strict alternation of roles for LLM compatibility
     const sanitizedHistory = [];
     for (const msg of history) {
         const last = sanitizedHistory[sanitizedHistory.length - 1];
@@ -93,14 +93,20 @@ STRICT RULE: Never use exclamation marks or emojis.`;
                 body: JSON.stringify(geminiPayload)
             });
 
-            const data = await response.json();
-            
+            const rawText = await response.text();
+            let data;
+            try {
+                data = JSON.parse(rawText);
+            } catch (e) {
+                console.log(`[GEMINI PARSE ERROR] Response was not JSON:`, rawText);
+            }
+
             if (response.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
                 const reply = data.candidates[0].content.parts[0].text.trim();
                 history.push({ role: 'assistant', content: reply });
                 return reply;
             } else {
-                console.log(`[GEMINI API ERROR] Status ${response.status}:`, JSON.stringify(data));
+                console.log(`[GEMINI API ERROR] Status ${response.status}:`, rawText);
             }
         } catch (err) {
             console.log('[GEMINI EXCEPTION]:', err.message);
@@ -129,21 +135,27 @@ STRICT RULE: Never use exclamation marks or emojis.`;
                 })
             });
 
-            const data = await response.json();
+            const rawText = await response.text();
+            let data;
+            try {
+                data = JSON.parse(rawText);
+            } catch (e) {
+                console.log(`[NVIDIA PARSE ERROR] Response was not JSON:`, rawText);
+            }
 
             if (response.ok && data?.choices?.[0]?.message?.content) {
                 const reply = data.choices[0].message.content.trim();
                 history.push({ role: 'assistant', content: reply });
                 return reply;
             } else {
-                console.log(`[NVIDIA API ERROR] Status ${response.status}:`, JSON.stringify(data));
+                console.log(`[NVIDIA API ERROR] Status ${response.status}:`, rawText);
             }
         } catch (err) {
             console.log('[NVIDIA EXCEPTION]:', err.message);
         }
     }
 
-    console.log('[FALLBACK] Both AI APIs failed or keys are missing. Using local keyword engine.');
+    console.log('[FALLBACK] Both AI APIs failed. Using local keyword engine.');
 
     // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
@@ -216,10 +228,16 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
+        // OWNER TAKEOVER LOGIC (Fixed to prevent self-muting)
         if (msg.key.fromMe) {
-            if (sender) {
+            if (sender && msg.key.id) {
+                if (botMessageIds.has(msg.key.id)) {
+                    // This message was sent by the bot itself, ignore it
+                    return;
+                }
+                // This message was manually typed by the human owner from another device/app
                 manualMutes.set(sender, Date.now());
-                console.log(`Human agent replied to ${sender}. Bot muted for this client for 45 minutes.`);
+                console.log(`Human agent replied manually to ${sender}. Bot muted for this client for 45 minutes.`);
             }
             return;
         }
@@ -229,7 +247,7 @@ async function startBot() {
 
         const lastMuted = manualMutes.get(sender) || 0;
         if (Date.now() - lastMuted < MUTE_DURATION) {
-            return;
+            return; // Bot is muted for this client because human took over
         }
 
         const lowerText = text.toLowerCase();
@@ -249,7 +267,16 @@ async function startBot() {
         await new Promise(resolve => setTimeout(resolve, typingDelay));
         
         await sock.sendPresenceUpdate('paused', sender);
-        await sock.sendMessage(sender, { text: replyText });
+        const sentMsg = await sock.sendMessage(sender, { text: replyText });
+
+        // Track bot-sent message ID so we don't mute ourselves
+        if (sentMsg?.key?.id) {
+            botMessageIds.add(sentMsg.key.id);
+            if (botMessageIds.size > 300) {
+                const firstKey = botMessageIds.values().next().value;
+                botMessageIds.delete(firstKey);
+            }
+        }
     });
 }
 
