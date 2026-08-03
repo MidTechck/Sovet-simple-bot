@@ -7,8 +7,8 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ? process.env.NVIDIA_API_KEY.trim() : "";
 
 // --- RAILWAY PERSISTENT STORAGE ---
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
@@ -46,9 +46,9 @@ app.listen(PORT, () => {
 });
 
 // --- BOT STATE & MEMORY ---
-const manualMutes = new Map(); // Tracks muted conversations: remoteJid -> timestamp
-const MUTE_DURATION = 45 * 60 * 1000; // 45 minutes
-const chatHistories = new Map(); // Tracks history for AI: remoteJid -> array
+const manualMutes = new Map();
+const MUTE_DURATION = 45 * 60 * 1000;
+const chatHistories = new Map();
 
 // --- AI GENERATION ENGINE ---
 async function generateAIResponse(senderNumber, userMessage) {
@@ -56,7 +56,16 @@ async function generateAIResponse(senderNumber, userMessage) {
     const history = chatHistories.get(senderNumber);
     
     history.push({ role: 'user', content: userMessage });
-    if (history.length > 6) history.shift(); // Keep only the last 6 messages
+    
+    // Ensure strict alternation of roles for LLM compatibility
+    const sanitizedHistory = [];
+    for (const msg of history) {
+        const last = sanitizedHistory[sanitizedHistory.length - 1];
+        if (!last || last.role !== msg.role) {
+            sanitizedHistory.push(msg);
+        }
+    }
+    if (sanitizedHistory.length > 8) sanitizedHistory.shift();
 
     const systemPrompt = `You are a friendly, concise human representative for Trustwave Technologies Ltd on WhatsApp. 
 Keep your responses short, natural, direct, and conversational (1-2 sentences max). 
@@ -68,25 +77,33 @@ STRICT RULE: Never use exclamation marks or emojis.`;
     // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
         try {
-            const geminiMessages = [
-                { role: 'user', parts: [{ text: systemPrompt }] },
-                ...history.map(h => ({ role: h.role === 'assistant' ? 'model' : 'user', parts: [{ text: h.content }] }))
-            ];
+            const geminiPayload = {
+                system_instruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                contents: sanitizedHistory.map(h => ({
+                    role: h.role === 'assistant' ? 'model' : 'user',
+                    parts: [{ text: h.content }]
+                }))
+            };
 
             const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contents: geminiMessages })
+                body: JSON.stringify(geminiPayload)
             });
 
             const data = await response.json();
-            const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (reply) {
+            
+            if (response.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+                const reply = data.candidates[0].content.parts[0].text.trim();
                 history.push({ role: 'assistant', content: reply });
-                return reply.trim();
+                return reply;
+            } else {
+                console.log(`[GEMINI API ERROR] Status ${response.status}:`, JSON.stringify(data));
             }
         } catch (err) {
-            console.log('Gemini API failed, attempting Nvidia fallback...');
+            console.log('[GEMINI EXCEPTION]:', err.message);
         }
     }
 
@@ -95,14 +112,14 @@ STRICT RULE: Never use exclamation marks or emojis.`;
         try {
             const nvidiaMessages = [
                 { role: 'system', content: systemPrompt },
-                ...history
+                ...sanitizedHistory
             ];
 
             const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${NVIDIA_API_KEY.trim()}`
+                    'Authorization': `Bearer ${NVIDIA_API_KEY}`
                 },
                 body: JSON.stringify({
                     model: 'nvidia/nemotron-4-34b-instruct',
@@ -113,15 +130,20 @@ STRICT RULE: Never use exclamation marks or emojis.`;
             });
 
             const data = await response.json();
-            const reply = data?.choices?.[0]?.message?.content;
-            if (reply) {
+
+            if (response.ok && data?.choices?.[0]?.message?.content) {
+                const reply = data.choices[0].message.content.trim();
                 history.push({ role: 'assistant', content: reply });
-                return reply.trim();
+                return reply;
+            } else {
+                console.log(`[NVIDIA API ERROR] Status ${response.status}:`, JSON.stringify(data));
             }
         } catch (err) {
-            console.log('Nvidia API failed, triggering local keywords...');
+            console.log('[NVIDIA EXCEPTION]:', err.message);
         }
     }
+
+    console.log('[FALLBACK] Both AI APIs failed or keys are missing. Using local keyword engine.');
 
     // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
@@ -194,7 +216,6 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
-        // OWNER TAKEOVER: If you send a message, mute the bot for THIS specific client for 45 mins.
         if (msg.key.fromMe) {
             if (sender) {
                 manualMutes.set(sender, Date.now());
@@ -206,13 +227,11 @@ async function startBot() {
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
 
-        // Check if this specific client is currently muted by owner takeover
         const lastMuted = manualMutes.get(sender) || 0;
         if (Date.now() - lastMuted < MUTE_DURATION) {
-            return; // Silently ignore the message for this client because human took over
+            return;
         }
 
-        // CLIENT REQUESTS HUMAN: Mute this client for 45 mins and send handover message.
         const lowerText = text.toLowerCase();
         if (lowerText.includes('owner') || lowerText.includes('human') || lowerText.includes('talk to someone')) {
             manualMutes.set(sender, Date.now()); 
