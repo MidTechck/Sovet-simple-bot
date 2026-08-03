@@ -49,7 +49,7 @@ app.listen(PORT, () => {
 const manualMutes = new Map();
 const MUTE_DURATION = 45 * 60 * 1000;
 const chatHistories = new Map();
-const botMessageIds = new Set(); // Tracks messages sent by the bot itself to prevent self-muting
+const botMessageIds = new Set();
 
 // --- AI GENERATION ENGINE ---
 async function generateAIResponse(senderNumber, userMessage) {
@@ -74,20 +74,23 @@ If you don't know an exact price for a custom installation, say: "I can have our
 Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.
 STRICT RULE: Never use exclamation marks or emojis.`;
 
-    // 1. PRIMARY: GEMINI API
+    // 1. PRIMARY: GEMINI API (Using stable v1 endpoint)
     if (GEMINI_API_KEY) {
         try {
             const geminiPayload = {
-                system_instruction: {
-                    parts: [{ text: systemPrompt }]
-                },
-                contents: sanitizedHistory.map(h => ({
-                    role: h.role === 'assistant' ? 'model' : 'user',
-                    parts: [{ text: h.content }]
-                }))
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [{ text: `Instructions: ${systemPrompt}` }]
+                    },
+                    ...sanitizedHistory.map(h => ({
+                        role: h.role === 'assistant' ? 'model' : 'user',
+                        parts: [{ text: h.content }]
+                    }))
+                ]
             };
 
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(geminiPayload)
@@ -113,7 +116,7 @@ STRICT RULE: Never use exclamation marks or emojis.`;
         }
     }
 
-    // 2. SECONDARY: NVIDIA API
+    // 2. SECONDARY: NVIDIA API (Using stable Llama 3.1 model)
     if (NVIDIA_API_KEY) {
         try {
             const nvidiaMessages = [
@@ -128,7 +131,7 @@ STRICT RULE: Never use exclamation marks or emojis.`;
                     'Authorization': `Bearer ${NVIDIA_API_KEY}`
                 },
                 body: JSON.stringify({
-                    model: 'nvidia/nemotron-4-34b-instruct',
+                    model: 'meta/llama-3.1-8b-instruct',
                     messages: nvidiaMessages,
                     max_tokens: 150,
                     temperature: 0.7
@@ -228,14 +231,11 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
-        // OWNER TAKEOVER LOGIC (Fixed to prevent self-muting)
         if (msg.key.fromMe) {
             if (sender && msg.key.id) {
                 if (botMessageIds.has(msg.key.id)) {
-                    // This message was sent by the bot itself, ignore it
                     return;
                 }
-                // This message was manually typed by the human owner from another device/app
                 manualMutes.set(sender, Date.now());
                 console.log(`Human agent replied manually to ${sender}. Bot muted for this client for 45 minutes.`);
             }
@@ -247,7 +247,7 @@ async function startBot() {
 
         const lastMuted = manualMutes.get(sender) || 0;
         if (Date.now() - lastMuted < MUTE_DURATION) {
-            return; // Bot is muted for this client because human took over
+            return;
         }
 
         const lowerText = text.toLowerCase();
@@ -269,7 +269,6 @@ async function startBot() {
         await sock.sendPresenceUpdate('paused', sender);
         const sentMsg = await sock.sendMessage(sender, { text: replyText });
 
-        // Track bot-sent message ID so we don't mute ourselves
         if (sentMsg?.key?.id) {
             botMessageIds.add(sentMsg.key.id);
             if (botMessageIds.size > 300) {
