@@ -51,7 +51,7 @@ app.listen(PORT, () => {
 
 // --- BOT STATE & MEMORY ---
 const manualMutes = new Map();
-const MUTE_DURATION = 45 * 60 * 1000;
+const MUTE_DURATION = 30 * 60 * 1000; // Reduced to 30 minutes per request
 const chatHistories = new Map();
 const botMessageIds = new Set(); // Tracks messages sent by the bot itself to prevent self-muting
 const lastLeadAlert = new Map();
@@ -171,13 +171,22 @@ async function generateAIResponse(senderNumber, userMessage) {
     }
     if (sanitizedHistory.length > 8) sanitizedHistory.shift();
 
-    const systemPrompt = `You are a friendly, concise human representative for Trustwave Technologies Ltd on WhatsApp. 
-Keep your responses short, natural, direct, and conversational (1-2 sentences max). 
-Never use robotic corporate intros like "Hello, I am the assistant for...". Talk like a real person typing quickly on a phone.
-If you don't know an exact price for a custom installation (like CCTV), say: "I can have our team calculate a quote for your setup and get back to you shortly."
-Services provided: CCTV cameras, access control systems, IT security services, and Starlink setups.
+    const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. The current year is 2026. All prices are in Zambian Kwacha (k).
+Keep your responses short, natural, direct, and conversational (1-2 sentences max). Talk like a real person typing quickly on a phone.
 
-STARLINK PRICING & INFO:
+STRICT RULES:
+1. Never use robotic corporate intros or say "Hi I'm from Sovet Link" unless specifically asked who you are.
+2. Never mention prices or talk about money unless the customer explicitly asks for them.
+3. If a customer is ready to pay, book a service, or talks about sending money/booking, professionally state that you will connect them with the team to finalize the booking and do not generate further sales pitches.
+4. Never use exclamation marks or emojis.
+
+COMPANY INFO:
+- Website: sovetlinkzambia.com
+- Locations: Based in Lusaka Woodlands and Ndola, but services are done countrywide across Zambia.
+- Contact: +260 968 252 812, info@sovetlink.com. Open Mon-Sun 08:00-18:00.
+- Services: Starlink installation, CCTV systems, networking solutions, IT support services, and monthly internet.
+
+STARLINK PRICING (ONLY SHARE IF EXPLICITLY ASKED):
 - Standard Gen 3 Kit: k8,500 (ideal for home and business)
 - Mini Starlink: k6,500 (highly portable, suitable for traveling)
 - Original Mount: k2,000
@@ -186,7 +195,7 @@ STARLINK PRICING & INFO:
 - Monthly Unlimited Data: k800
 - Coverage: Both models cover 20 to 25 meters.
 
-STRICT RULE: Never use exclamation marks or emojis.`;
+If you don't know an exact price for a custom setup (like CCTV), say: "I can have our team calculate a quote for your setup and get back to you shortly."`;
 
     // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
@@ -352,7 +361,7 @@ async function startBot() {
                 // This message was manually typed by the human owner from another device/app
                 manualMutes.set(sender, Date.now());
                 saveState();
-                console.log(`Human agent replied manually to ${sender}. Bot muted for this client for 45 minutes.`);
+                console.log(`Human agent replied manually to ${sender}. Bot muted for this client for 30 minutes.`);
             }
             return;
         }
