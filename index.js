@@ -53,6 +53,7 @@ app.listen(PORT, () => {
 const manualMutes = new Map();
 const MUTE_DURATION = 30 * 60 * 1000; // 30 minutes
 const chatHistories = new Map();
+const MAX_RAW_HISTORY = 20; // keeps bot_state.json and memory bounded no matter how long a chat runs
 const botMessageIds = new Set();
 const lastLeadAlert = new Map();
 const LEAD_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
@@ -69,6 +70,15 @@ async function sendTrackedMessage(sock, jid, content) {
         botMessageIds.delete(firstKey);
     }
     return sock.sendMessage(jid, content, { messageId });
+}
+
+// Deterministic cleanup applied to every outgoing reply, regardless of which AI tier produced it.
+// Backs up the "no exclamation marks or emojis" prompt rule with a hard guarantee.
+function sanitizeReply(text) {
+    let cleaned = text.replace(/!+/g, '.');
+    cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '');
+    cleaned = cleaned.replace(/\.{2,}/g, '.').replace(/[ \t]{2,}/g, ' ').trim();
+    return cleaned;
 }
 
 // --- STATE PERSISTENCE ---
@@ -135,9 +145,12 @@ function getLeadCount() {
     }
 }
 
-async function checkBuyingIntent(sock, sender, text, isMuted) {
+// isAdLead is passed through so a fresh ad click always counts as a hot lead,
+// even when the customer's own words don't contain a buying-intent keyword.
+async function checkBuyingIntent(sock, sender, text, isMuted, isAdLead = false) {
     const lower = text.toLowerCase();
-    const matched = BUYING_INTENT_KEYWORDS.some(k => lower.includes(k));
+    const keywordMatch = BUYING_INTENT_KEYWORDS.some(k => lower.includes(k));
+    const matched = keywordMatch || isAdLead;
     if (!matched) return;
 
     logLead(sender, text);
@@ -164,10 +177,25 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
     if (!chatHistories.has(senderNumber)) chatHistories.set(senderNumber, []);
     const history = chatHistories.get(senderNumber);
 
+    // Store the clean raw message so saved/replayed history never fills up with stale context tags.
+    history.push({ role: 'user', content: userMessage });
+    if (history.length > MAX_RAW_HISTORY) {
+        history.splice(0, history.length - MAX_RAW_HISTORY);
+    }
+
+    const sanitizedHistory = [];
+    for (const msg of history) {
+        const last = sanitizedHistory[sanitizedHistory.length - 1];
+        if (!last || last.role !== msg.role) {
+            sanitizedHistory.push(msg);
+        }
+    }
+    while (sanitizedHistory.length > 8) sanitizedHistory.shift();
+
     // Calculate current time dynamically in Central Africa Time (Zambia)
     const nowZambia = new Date(new Date().toLocaleString("en-US", { timeZone: "Africa/Lusaka" }));
     const currentHour = nowZambia.getHours();
-    
+
     let timeOfDay = "evening";
     if (currentHour >= 5 && currentHour < 12) {
         timeOfDay = "morning";
@@ -179,45 +207,49 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
 
     const timeContextString = `[REAL-TIME CONTEXT: The current year is 2026. The current local time in Zambia is ${nowZambia.toLocaleTimeString()} and it is currently ${timeOfDay}. Adjust any time-based greetings to match this exact time.]`;
 
-    // Context tag for initial ad referrals
-    const processedInput = isAdLead 
-        ? `${timeContextString} [SYSTEM CONTEXT: The customer just clicked our Starlink Facebook/Instagram advertisement. IMMEDIATELY answer them by pitching our Starlink packages.] ${userMessage}`
-        : `${timeContextString} ${userMessage}`;
-
-    history.push({ role: 'user', content: processedInput });
-    
-    const sanitizedHistory = [];
-    for (const msg of history) {
-        const last = sanitizedHistory[sanitizedHistory.length - 1];
-        if (!last || last.role !== msg.role) {
-            sanitizedHistory.push(msg);
+    // Inject the live time/ad context onto just this call's copy of the latest turn,
+    // instead of permanently baking it into the stored conversation history.
+    if (sanitizedHistory.length > 0) {
+        const lastIndex = sanitizedHistory.length - 1;
+        const lastEntry = sanitizedHistory[lastIndex];
+        if (lastEntry.role === 'user') {
+            const contextPrefix = isAdLead
+                ? `${timeContextString} [SYSTEM CONTEXT: The customer just clicked our Starlink Facebook/Instagram advertisement. IMMEDIATELY answer them by pitching our Starlink packages.] `
+                : `${timeContextString} `;
+            sanitizedHistory[lastIndex] = { role: lastEntry.role, content: contextPrefix + lastEntry.content };
         }
     }
-    if (sanitizedHistory.length > 8) sanitizedHistory.shift();
 
     const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
-Keep your responses short, natural, direct, and conversational (1-2 sentences max). Talk like a real person typing quickly on a phone.
+Keep every reply SHORT: one short sentence is ideal, two only if truly necessary. Never chain multiple facts together with commas or "and" into one long sentence, if you have two things to say, send them as two short back-to-back sentences instead. Talk like a real person quickly typing on a phone, not a brochure.
 
 TIME AWARENESS RULE:
 - Pay close attention to the real-time context provided in the message. Never say "Good morning" if it is afternoon or evening. Match your greetings to the actual time of day (morning, afternoon, or evening) or skip greetings entirely and answer directly.
 
-ACCEPTED PAYMENT METHODS:
-- We currently accept Airtel Money and bank transfers.
+STRICT GREETING RULE (NATURAL CONVERSATION):
+- If a customer simply says "hello", "hi", or offers a basic greeting, DO NOT instantly start selling Starlink or listing prices.
+- Respond naturally with something like "Hi, how may we help you?" or "Hello! How can we assist you today?"
+- Wait for them to state what they are looking for before pitching products.
 
 CRITICAL AD HANDLING RULE:
 - If a customer contacts us from an ad (e.g. asking "Can I get more info on this?", "Hi! Please let us know how we can help you", or sending an ad template message), IMMEDIATELY recognize they came from our Starlink advert.
 - Briefly introduce the Starlink options right away (e.g., "We have the Starlink Gen 3 for k8,500 and the Starlink Mini for k6,500 in stock. Which one are you looking for?").
 - NEVER reply to an ad lead with vague questions like "What would you like to know about Sovet Link Technologies?".
 
+ACCEPTED PAYMENT METHODS:
+- We currently accept Airtel Money and bank transfers.
+- NEVER promise or mention a "payment confirmation link" or automated checkout links. If a customer asks how to pay, just state the methods or tell them a human agent will assist them.
+
 ANTI-HALLUCINATION & OPERATIONAL LIMITS:
 - YOU CANNOT SEND EMAILS, generate PDFs, or create official documents. If a customer asks for a quotation document to share with management, tell them you will have a human representative send the official quotation right away.
 - NEVER promise that a team can travel to remote locations for installation.
+- NEVER invent or send any links, especially payment links.
 
 MANDATORY LOCATION & PRICING MATRIX:
 1. BEFORE quoting any installation fees, you MUST ask the customer what city or location they are in.
 2. IF LUSAKA OR EASTERN PROVINCE: Apply a k1,500 service charge (due to capacity constraints) + the k2,000 standard installation fee.
 3. IF KITWE DISTRICT: Apply the k2,000 installation fee. No service charge applies.
-4. IF ANYWHERE ELSE (Mpika, Solwezi, remote/rural areas, etc.): Tell them we can simply ship the kit directly to them, and it is incredibly easy to set up themselves (just like a DSTV decoder). Do NOT offer a physical installation team.
+4. IF ANYWHERE ELSE (Mpika, Solwezi, remote/rural areas, etc.): Tell them we ship locally from within Zambia using fast local courier services, and the kit is incredibly easy to set up themselves (just like a DSTV decoder). Do NOT offer a physical installation team.
 5. If a remote customer or corporate organization INSISTS on a physical team coming out, state that transport and logistics fees will apply, and say you will have management prepare a formal custom quotation.
 
 STARLINK PACKAGES:
@@ -225,6 +257,8 @@ STARLINK PACKAGES:
 - Mini Starlink: k6,500 (portable/traveling, 20-25m coverage)
 - Original Mount: k2,000
 - Monthly Unlimited Data: k800
+
+Note: the Original Mount and the installation fee above are two separate k2,000 charges. Always account for both in a full quote unless the customer only wants the mount without installation.
 
 STRICT GENERAL RULES:
 1. Never use robotic corporate intros or say "Hi I'm from Sovet Link" unless specifically asked who you are.
@@ -317,18 +351,24 @@ STRICT GENERAL RULES:
 
     // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
-    if (isAdLead || lower.includes('starlink')) {
-        return "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
-    }
-    if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
-        return "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
+    let fallbackReply;
+    if (isAdLead) {
+        fallbackReply = "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
+    } else if (lower.includes('starlink')) {
+        fallbackReply = "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
+    } else if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
+        fallbackReply = "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
     } else if (lower.includes('price') || lower.includes('cost') || lower.includes('how much') || lower.includes('install')) {
-        return "Our installation pricing depends on your exact location. Which city are you located in.";
+        fallbackReply = "Our installation pricing depends on your exact location. Which city are you located in.";
     } else if (lower.includes('pay') || lower.includes('payment') || lower.includes('airtel') || lower.includes('bank')) {
-        return "We currently accept Airtel Money and bank transfers.";
+        fallbackReply = "We currently accept Airtel Money and bank transfers.";
+    } else {
+        fallbackReply = "Hello. How can we assist you with your internet or IT setup today.";
     }
 
-    return "Hello. How can we assist you with your internet or IT setup today.";
+    // Record it too, so the fallback tier doesn't create a gap in the conversation's memory.
+    history.push({ role: 'assistant', content: fallbackReply });
+    return fallbackReply;
 }
 
 // --- WHATSAPP BOT CORE ---
@@ -405,7 +445,7 @@ async function startBot() {
 
         const cleanText = text.trim().toLowerCase();
 
-        // --- COMMAND: /human ---
+       // --- COMMAND: /human ---
         if (cleanText === '/human') {
             manualMutes.set(sender, Date.now());
             saveState();
@@ -413,28 +453,33 @@ async function startBot() {
             await sendTrackedMessage(sock, sender, { text: "AI Assistant paused. You are now connected directly to a human representative." });
             return;
         }
-
-        // --- COMMAND: /number of leads (SECURE ADMIN CHECK) ---
+   
+        // --- COMMAND: /number of leads (owner-only) ---
         if (cleanText === '/number of leads' || cleanText === 'number of leads') {
             const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/[^0-9]/g, ''));
-            
-            if (isOwner || sender.endsWith('@s.whatsapp.net')) {
+            if (isOwner) {
                 const totalLeads = getLeadCount();
                 await sendTrackedMessage(sock, sender, { text: `Total recorded leads: ${totalLeads}` });
-                return;
-            } else {
-                return;
             }
+            return;
         }
+
+        const lowerText = text.toLowerCase();
+
+        // AD REFERRAL DETECTION (computed early so it can also drive the lead check below)
+        const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
+        const hasAdContextMetadata = !!(contextInfo?.externalAdReply || contextInfo?.adReplyInfo);
+        const isAdTemplateText = lowerText.includes('can i get more info on this') || lowerText.includes('please let us know how we can help you');
+        const isAdLead = hasAdContextMetadata || isAdTemplateText;
 
         const lastMuted = manualMutes.get(sender) || 0;
         const isMuted = Date.now() - lastMuted < MUTE_DURATION;
 
-        await checkBuyingIntent(sock, sender, text, isMuted);
+        // A fresh ad click always counts as a hot lead, even if the message text itself has no keyword.
+        await checkBuyingIntent(sock, sender, text, isMuted, isAdLead);
 
         if (isMuted) return;
 
-        const lowerText = text.toLowerCase();
         if (lowerText.includes('owner') || lowerText.includes('human') || lowerText.includes('talk to someone')) {
             manualMutes.set(sender, Date.now());
             saveState();
@@ -442,26 +487,20 @@ async function startBot() {
             return;
         }
 
-        // AD REFERRAL DETECTION
-        const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
-        const hasAdContextMetadata = !!(contextInfo?.externalAdReply || contextInfo?.adReplyInfo);
-        const isAdTemplateText = lowerText.includes('can i get more info on this') || lowerText.includes('please let us know how we can help you');
-        const isAdLead = hasAdContextMetadata || isAdTemplateText;
-
         console.log(`Received message from ${sender}: "${text}" (AdLead: ${isAdLead})`);
 
         await sock.sendPresenceUpdate('composing', sender);
-        
-        const replyText = await generateAIResponse(sender, text, isAdLead);
+
+        const rawReply = await generateAIResponse(sender, text, isAdLead);
+        const replyText = sanitizeReply(rawReply);
         saveState();
-        
+
         const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
         await new Promise(resolve => setTimeout(resolve, typingDelay));
-        
+
         await sock.sendPresenceUpdate('paused', sender);
         await sendTrackedMessage(sock, sender, { text: replyText });
     });
 }
 
 startBot();
-
