@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ? process.env.NVIDIA_API_KEY.trim() : "";
 const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER ? process.env.OWNER_NOTIFY_NUMBER.trim() : "";
+const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE ? process.env.OWNER_DIRECT_LINE.trim() : "";
 
 // --- RAILWAY PERSISTENT STORAGE ---
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
@@ -56,7 +57,7 @@ const chatHistories = new Map();
 const MAX_RAW_HISTORY = 20; // keeps bot_state.json and memory bounded no matter how long a chat runs
 const botMessageIds = new Set();
 const lastLeadAlert = new Map();
-const LEAD_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
+const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutes - short enough that a fast-escalating lead in one conversation still gets flagged
 
 function generateMessageID() {
     return crypto.randomBytes(16).toString('hex').toUpperCase();
@@ -220,7 +221,7 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
         }
     }
 
-    const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
+   const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
 Keep every reply SHORT: one short sentence is ideal, two only if truly necessary. Never chain multiple facts together with commas or "and" into one long sentence, if you have two things to say, send them as two short back-to-back sentences instead. Talk like a real person quickly typing on a phone, not a brochure.
 
 TIME AWARENESS RULE:
@@ -228,8 +229,9 @@ TIME AWARENESS RULE:
 
 STRICT GREETING RULE (NATURAL CONVERSATION):
 - If a customer simply says "hello", "hi", or offers a basic greeting, DO NOT instantly start selling Starlink or listing prices.
-- Respond naturally with something like "Hi, how may we help you?" or "Hello! How can we assist you today?"
+- Respond naturally with something like "Hi, how may we help you?" or "Hello, how can we assist you today?"
 - Wait for them to state what they are looking for before pitching products.
+- This does not apply to ad leads below, those get the immediate pitch.
 
 CRITICAL AD HANDLING RULE:
 - If a customer contacts us from an ad (e.g. asking "Can I get more info on this?", "Hi! Please let us know how we can help you", or sending an ad template message), IMMEDIATELY recognize they came from our Starlink advert.
@@ -244,12 +246,17 @@ ANTI-HALLUCINATION & OPERATIONAL LIMITS:
 - YOU CANNOT SEND EMAILS, generate PDFs, or create official documents. If a customer asks for a quotation document to share with management, tell them you will have a human representative send the official quotation right away.
 - NEVER promise that a team can travel to remote locations for installation.
 - NEVER invent or send any links, especially payment links.
+- NEVER invent a physical shop address, walk-in location, or specific team availability hours, none of that has been provided to you. If a customer wants to visit in person or send someone to buy directly, tell them a team member will confirm the exact pickup location and timing with them directly.
+
+ESCALATION FOR QUESTIONS YOU CANNOT ANSWER:
+- If a customer asks something highly custom or technical that you cannot answer accurately or confidently, apologize briefly and do not guess at an answer.
+${OWNER_DIRECT_LINE ? `- Give them this number to call directly for help: ${OWNER_DIRECT_LINE}.` : `- Let them know a human representative will follow up with them directly.`}
 
 MANDATORY LOCATION & PRICING MATRIX:
 1. BEFORE quoting any installation fees, you MUST ask the customer what city or location they are in.
 2. IF LUSAKA OR EASTERN PROVINCE: Apply a k1,500 service charge (due to capacity constraints) + the k2,000 standard installation fee.
 3. IF KITWE DISTRICT: Apply the k2,000 installation fee. No service charge applies.
-4. IF ANYWHERE ELSE (Mpika, Solwezi, remote/rural areas, etc.): Tell them we ship locally from within Zambia using fast local courier services, and the kit is incredibly easy to set up themselves (just like a DSTV decoder). Do NOT offer a physical installation team.
+4. IF ANYWHERE ELSE (Mpika, Solwezi, remote/rural areas, etc.): Tell them we ship locally from within Zambia using fast local courier services, and the kit is incredibly easy to set up themselves (just like a DSTV decoder). Do NOT imply the kit is coming from outside Zambia or being imported. Do NOT offer a physical installation team.
 5. If a remote customer or corporate organization INSISTS on a physical team coming out, state that transport and logistics fees will apply, and say you will have management prepare a formal custom quotation.
 
 STARLINK PACKAGES:
@@ -352,9 +359,7 @@ STRICT GENERAL RULES:
     // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
     let fallbackReply;
-    if (isAdLead) {
-        fallbackReply = "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
-    } else if (lower.includes('starlink')) {
+    if (isAdLead || lower.includes('starlink')) {
         fallbackReply = "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
     } else if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
         fallbackReply = "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
@@ -445,7 +450,7 @@ async function startBot() {
 
         const cleanText = text.trim().toLowerCase();
 
-       // --- COMMAND: /human ---
+        // --- COMMAND: /human ---
         if (cleanText === '/human') {
             manualMutes.set(sender, Date.now());
             saveState();
@@ -453,7 +458,7 @@ async function startBot() {
             await sendTrackedMessage(sock, sender, { text: "AI Assistant paused. You are now connected directly to a human representative." });
             return;
         }
-   
+
         // --- COMMAND: /number of leads (owner-only) ---
         if (cleanText === '/number of leads' || cleanText === 'number of leads') {
             const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/[^0-9]/g, ''));
