@@ -57,7 +57,7 @@ const chatHistories = new Map();
 const MAX_RAW_HISTORY = 20; // keeps bot_state.json and memory bounded no matter how long a chat runs
 const botMessageIds = new Set();
 const lastLeadAlert = new Map();
-const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutes - short enough that a fast-escalating lead in one conversation still gets flagged
+const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutes
 
 function generateMessageID() {
     return crypto.randomBytes(16).toString('hex').toUpperCase();
@@ -73,8 +73,7 @@ async function sendTrackedMessage(sock, jid, content) {
     return sock.sendMessage(jid, content, { messageId });
 }
 
-// Deterministic cleanup applied to every outgoing reply, regardless of which AI tier produced it.
-// Backs up the "no exclamation marks or emojis" prompt rule with a hard guarantee.
+// Deterministic cleanup applied to every outgoing AI reply
 function sanitizeReply(text) {
     let cleaned = text.replace(/!+/g, '.');
     cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '');
@@ -125,6 +124,15 @@ const BUYING_INTENT_KEYWORDS = [
     'schedule', 'appointment', 'deposit', 'pay'
 ];
 
+const AD_LEAD_GREETING = `Hi! 👋 Thanks for your interest in Starlink 🚀
+
+Here's our current offer:
+
+📡 Starlink Kit: K8,500
+🔩 Original Starlink Mount: K2,000
+🌐 Monthly Subscription: K800 — Unlimited Data
+🛠️ Professional Installation: K1,500 within Lusaka & Copperbelt`;
+
 function logLead(sender, text) {
     try {
         const entry = `${new Date().toISOString()} | ${sender.split('@')[0]} | ${text.replace(/\s+/g, ' ')}\n`;
@@ -146,8 +154,6 @@ function getLeadCount() {
     }
 }
 
-// isAdLead is passed through so a fresh ad click always counts as a hot lead,
-// even when the customer's own words don't contain a buying-intent keyword.
 async function checkBuyingIntent(sock, sender, text, isMuted, isAdLead = false) {
     const lower = text.toLowerCase();
     const keywordMatch = BUYING_INTENT_KEYWORDS.some(k => lower.includes(k));
@@ -178,7 +184,6 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
     if (!chatHistories.has(senderNumber)) chatHistories.set(senderNumber, []);
     const history = chatHistories.get(senderNumber);
 
-    // Store the clean raw message so saved/replayed history never fills up with stale context tags.
     history.push({ role: 'user', content: userMessage });
     if (history.length > MAX_RAW_HISTORY) {
         history.splice(0, history.length - MAX_RAW_HISTORY);
@@ -193,7 +198,6 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
     }
     while (sanitizedHistory.length > 8) sanitizedHistory.shift();
 
-    // Calculate current time dynamically in Central Africa Time (Zambia)
     const nowZambia = new Date(new Date().toLocaleString("en-US", { timeZone: "Africa/Lusaka" }));
     const currentHour = nowZambia.getHours();
 
@@ -208,8 +212,6 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
 
     const timeContextString = `[REAL-TIME CONTEXT: The current year is 2026. The current local time in Zambia is ${nowZambia.toLocaleTimeString()} and it is currently ${timeOfDay}. Adjust any time-based greetings to match this exact time.]`;
 
-    // Inject the live time/ad context onto just this call's copy of the latest turn,
-    // instead of permanently baking it into the stored conversation history.
     if (sanitizedHistory.length > 0) {
         const lastIndex = sanitizedHistory.length - 1;
         const lastEntry = sanitizedHistory[lastIndex];
@@ -221,7 +223,7 @@ async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
         }
     }
 
-   const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
+    const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
 Keep every reply SHORT: one short sentence is ideal, two only if truly necessary. Never chain multiple facts together with commas or "and" into one long sentence, if you have two things to say, send them as two short back-to-back sentences instead. Talk like a real person quickly typing on a phone, not a brochure.
 
 TIME AWARENESS RULE:
@@ -231,22 +233,19 @@ STRICT GREETING RULE (NATURAL CONVERSATION):
 - If a customer simply says "hello", "hi", or offers a basic greeting, DO NOT instantly start selling Starlink or listing prices.
 - Respond naturally with something like "Hi, how may we help you?" or "Hello, how can we assist you today?"
 - Wait for them to state what they are looking for before pitching products.
-- This does not apply to ad leads below, those get the immediate pitch.
 
 CRITICAL AD HANDLING RULE:
 - If a customer contacts us from an ad (e.g. asking "Can I get more info on this?", "Hi! Please let us know how we can help you", or sending an ad template message), IMMEDIATELY recognize they came from our Starlink advert.
-- Briefly introduce the Starlink options right away (e.g., "We have the Starlink Gen 3 for k8,500 and the Starlink Mini for k6,500 in stock. Which one are you looking for?").
-- NEVER reply to an ad lead with vague questions like "What would you like to know about Sovet Link Technologies?".
+- Briefly introduce the Starlink options right away.
 
 ACCEPTED PAYMENT METHODS:
 - We currently accept Airtel Money and bank transfers.
-- NEVER promise or mention a "payment confirmation link" or automated checkout links. If a customer asks how to pay, just state the methods or tell them a human agent will assist them.
+- NEVER promise or mention a "payment confirmation link" or automated checkout links.
 
 ANTI-HALLUCINATION & OPERATIONAL LIMITS:
-- YOU CANNOT SEND EMAILS, generate PDFs, or create official documents. If a customer asks for a quotation document to share with management, tell them you will have a human representative send the official quotation right away.
-- NEVER promise that a team can travel to remote locations for installation.
+- YOU CANNOT SEND EMAILS, generate PDFs, or create official documents.
 - NEVER invent or send any links, especially payment links.
-- NEVER invent a physical shop address, walk-in location, or specific team availability hours, none of that has been provided to you. If a customer wants to visit in person or send someone to buy directly, tell them a team member will confirm the exact pickup location and timing with them directly.
+- NEVER invent a physical shop address or walk-in location.
 
 ESCALATION FOR QUESTIONS YOU CANNOT ANSWER:
 - If a customer asks something highly custom or technical that you cannot answer accurately or confidently, apologize briefly and do not guess at an answer.
@@ -254,9 +253,9 @@ ${OWNER_DIRECT_LINE ? `- Give them this number to call directly for help: ${OWNE
 
 MANDATORY LOCATION & PRICING MATRIX:
 1. BEFORE quoting any installation fees, you MUST ask the customer what city or location they are in.
-2. IF LUSAKA OR EASTERN PROVINCE: Apply a k1,500 service charge (due to capacity constraints) + the k2,000 standard installation fee.
-3. IF KITWE DISTRICT: Apply the k2,000 installation fee. No service charge applies.
-4. IF ANYWHERE ELSE (Mpika, Solwezi, remote/rural areas, etc.): Tell them we ship locally from within Zambia using fast local courier services, and the kit is incredibly easy to set up themselves (just like a DSTV decoder). Do NOT imply the kit is coming from outside Zambia or being imported. Do NOT offer a physical installation team.
+2. IF LUSAKA OR EASTERN PROVINCE: Apply a k1,500 service charge + the k2,000 standard installation fee.
+3. IF KITWE DISTRICT / COPPERBELT: Apply the k2,000 installation fee.
+4. IF OUTSIDE LUSAKA OR COPPERBELT (Mpika, Solwezi, remote/distant areas): Tell them we can still supply the Starlink kit. Offer two options: 1) We send the kit to their location and guide them through installation remotely, OR 2) We discuss arranging a professional installer in their area. Ask for their specific town/location so we can advise on the best option. NEVER say "set it up yourself like DSTV".
 5. If a remote customer or corporate organization INSISTS on a physical team coming out, state that transport and logistics fees will apply, and say you will have management prepare a formal custom quotation.
 
 STARLINK PACKAGES:
@@ -265,21 +264,18 @@ STARLINK PACKAGES:
 - Original Mount: k2,000
 - Monthly Unlimited Data: k800
 
-Note: the Original Mount and the installation fee above are two separate k2,000 charges. Always account for both in a full quote unless the customer only wants the mount without installation.
-
 STRICT GENERAL RULES:
-1. Never use robotic corporate intros or say "Hi I'm from Sovet Link" unless specifically asked who you are.
+1. Never use robotic corporate intros.
 2. Do not bombard customers with long lists of prices unless explicitly asked.
 3. If you don't know an exact price for a custom setup (like CCTV), say: "I can have our team calculate a quote for your setup and get back to you shortly."
-4. Never use exclamation marks or emojis.`;
+4. Never use exclamation marks or emojis.
+5. Do not repeat a price or fact you have already stated earlier in this conversation.`;
 
-    // 1. PRIMARY: GEMINI API
+  // 1. PRIMARY: GEMINI API
     if (GEMINI_API_KEY) {
         try {
             const geminiPayload = {
-                system_instruction: {
-                    parts: [{ text: systemPrompt }]
-                },
+                system_instruction: { parts: [{ text: systemPrompt }] },
                 contents: sanitizedHistory.map(h => ({
                     role: h.role === 'assistant' ? 'model' : 'user',
                     parts: [{ text: h.content }]
@@ -294,18 +290,12 @@ STRICT GENERAL RULES:
 
             const rawText = await response.text();
             let data;
-            try {
-                data = JSON.parse(rawText);
-            } catch (e) {
-                console.log(`[GEMINI PARSE ERROR] Response was not JSON:`, rawText);
-            }
+            try { data = JSON.parse(rawText); } catch (e) {}
 
             if (response.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
                 const reply = data.candidates[0].content.parts[0].text.trim();
                 history.push({ role: 'assistant', content: reply });
                 return reply;
-            } else {
-                console.log(`[GEMINI API ERROR] Status ${response.status}:`, rawText);
             }
         } catch (err) {
             console.log('[GEMINI EXCEPTION]:', err.message);
@@ -336,27 +326,19 @@ STRICT GENERAL RULES:
 
             const rawText = await response.text();
             let data;
-            try {
-                data = JSON.parse(rawText);
-            } catch (e) {
-                console.log(`[NVIDIA PARSE ERROR] Response was not JSON:`, rawText);
-            }
+            try { data = JSON.parse(rawText); } catch (e) {}
 
             if (response.ok && data?.choices?.[0]?.message?.content) {
                 const reply = data.choices[0].message.content.trim();
                 history.push({ role: 'assistant', content: reply });
                 return reply;
-            } else {
-                console.log(`[NVIDIA API ERROR] Status ${response.status}:`, rawText);
             }
         } catch (err) {
             console.log('[NVIDIA EXCEPTION]:', err.message);
         }
     }
 
-    console.log('[FALLBACK] Both AI APIs failed. Using local keyword engine.');
-
-    // 3. ULTIMATE BACKUP: LOCAL KEYWORDS
+    // 3. FALLBACK: LOCAL KEYWORDS
     const lower = userMessage.toLowerCase();
     let fallbackReply;
     if (isAdLead || lower.includes('starlink')) {
@@ -371,7 +353,6 @@ STRICT GENERAL RULES:
         fallbackReply = "Hello. How can we assist you with your internet or IT setup today.";
     }
 
-    // Record it too, so the fallback tier doesn't create a gap in the conversation's memory.
     history.push({ role: 'assistant', content: fallbackReply });
     return fallbackReply;
 }
@@ -432,7 +413,6 @@ async function startBot() {
 
         const sender = msg.key.remoteJid;
 
-        // OWNER TAKEOVER LOGIC
         if (msg.key.fromMe) {
             if (sender && msg.key.id) {
                 if (botMessageIds.has(msg.key.id)) return;
@@ -450,16 +430,13 @@ async function startBot() {
 
         const cleanText = text.trim().toLowerCase();
 
-        // --- COMMAND: /human ---
         if (cleanText === '/human') {
             manualMutes.set(sender, Date.now());
             saveState();
-            console.log(`Override triggered by ${sender}. Bot muted for 30 minutes.`);
             await sendTrackedMessage(sock, sender, { text: "AI Assistant paused. You are now connected directly to a human representative." });
             return;
         }
 
-        // --- COMMAND: /number of leads (owner-only) ---
         if (cleanText === '/number of leads' || cleanText === 'number of leads') {
             const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/[^0-9]/g, ''));
             if (isOwner) {
@@ -469,9 +446,8 @@ async function startBot() {
             return;
         }
 
-        const lowerText = text.toLowerCase();
+const lowerText = text.toLowerCase();
 
-        // AD REFERRAL DETECTION (computed early so it can also drive the lead check below)
         const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
         const hasAdContextMetadata = !!(contextInfo?.externalAdReply || contextInfo?.adReplyInfo);
         const isAdTemplateText = lowerText.includes('can i get more info on this') || lowerText.includes('please let us know how we can help you');
@@ -480,7 +456,6 @@ async function startBot() {
         const lastMuted = manualMutes.get(sender) || 0;
         const isMuted = Date.now() - lastMuted < MUTE_DURATION;
 
-        // A fresh ad click always counts as a hot lead, even if the message text itself has no keyword.
         await checkBuyingIntent(sock, sender, text, isMuted, isAdLead);
 
         if (isMuted) return;
@@ -489,6 +464,22 @@ async function startBot() {
             manualMutes.set(sender, Date.now());
             saveState();
             await sendTrackedMessage(sock, sender, { text: "I have connected you with our team. Someone will be with you shortly." });
+            return;
+        }
+
+        if (lowerText.includes('can i get more info on this')) {
+            const typingDelay = Math.min(Math.max(AD_LEAD_GREETING.length * 20, 1500), 4000);
+            await sock.sendPresenceUpdate('composing', sender);
+            await new Promise(resolve => setTimeout(resolve, typingDelay));
+            await sock.sendPresenceUpdate('paused', sender);
+            await sendTrackedMessage(sock, sender, { text: AD_LEAD_GREETING });
+
+            if (!chatHistories.has(sender)) chatHistories.set(sender, []);
+            const history = chatHistories.get(sender);
+            history.push({ role: 'user', content: text });
+            history.push({ role: 'assistant', content: AD_LEAD_GREETING });
+            if (history.length > MAX_RAW_HISTORY) history.splice(0, history.length - MAX_RAW_HISTORY);
+            saveState();
             return;
         }
 
@@ -509,3 +500,5 @@ async function startBot() {
 }
 
 startBot();
+
+
