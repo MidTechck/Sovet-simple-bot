@@ -8,18 +8,19 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ? process.env.NVIDIA_API_KEY.trim() : "";
-const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER ? process.env.OWNER_NOTIFY_NUMBER.trim() : "";
-const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE ? process.env.OWNER_DIRECT_LINE.trim() : "";
+// ====== ENV ======
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || '';
+const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER || '';
+const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE || '';
 
-// --- RAILWAY PERSISTENT STORAGE ---
+// ====== STORAGE (Railway volume) ======
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
 const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
 const LEADS_FILE = path.join(DATA_DIR, 'leads.log');
 
-// --- WEB SERVER FOR QR CODE ---
+// ====== WEB SERVER (QR) ======
 const app = express();
 const PORT = process.env.PORT || 8080;
 let qrCodeDataUrl = '';
@@ -28,36 +29,68 @@ let currentSock = null;
 
 app.get('/', (req, res) => {
     if (isConnected) {
-        return res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 20vh; color: green;">Bot is successfully connected to WhatsApp!</h2>');
-    } else if (qrCodeDataUrl) {
-        return res.send(`
-            <html>
-            <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="10"></head>
-            <body style="font-family: Arial, sans-serif; text-align: center; margin-top: 10vh;">
-                <h2>Scan this QR Code with WhatsApp</h2>
-                <p>Open WhatsApp > Linked Devices > Link a Device</p>
-                <img src="${qrCodeDataUrl}" alt="WhatsApp QR Code" style="max-width: 300px; height: auto; border: 3px solid #25D366; border-radius: 12px; padding: 10px;" />
-                <p style="color: gray; font-size: 14px;">This page refreshes automatically...</p>
-            </body>
-            </html>
-        `);
-    } else {
-        return res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 20vh;">Starting bot and generating QR code... Please wait.</h2><script>setTimeout(() => location.reload(), 3000);</script>');
+        return res.send('<h2 style="font-family:sans-serif;text-align:center;margin-top:40px;">Bot is connected</h2>');
     }
+    if (qrCodeDataUrl) {
+        return res.send(`
+            <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+            <body style="font-family:Arial;text-align:center;margin-top:40px;">
+                <h2>Scan QR Code with WhatsApp</h2>
+                <p>Linked Devices → Link a Device</p>
+                <img src="${qrCodeDataUrl}" style="max-width:300px">
+            </body></html>
+        `);
+    }
+    return res.send('<h2 style="font-family:sans-serif;text-align:center;margin-top:40px;">Waiting for QR...</h2>');
 });
+app.listen(PORT, () => console.log(`Web server on port ${PORT}`));
 
-app.listen(PORT, () => {
-    console.log(`Web server running on port ${PORT}.`);
-});
-
-// --- BOT STATE & MEMORY ---
+// ====== STATE ======
 const manualMutes = new Map();
-const MUTE_DURATION = 30 * 60 * 1000; // 30 minutes
-const chatHistories = new Map();
-const MAX_RAW_HISTORY = 20; // keeps bot_state.json and memory bounded no matter how long a chat runs
+const MUTE_DURATION = 30 * 60 * 1000;
+const customers = new Map();          // phone → { memory, history }
+const MAX_HISTORY = 12;
 const botMessageIds = new Set();
 const lastLeadAlert = new Map();
-const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutes
+const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000;
+
+function getCleanNumber(jid) {
+    if (!jid) return null;
+    return jid.split('@')[0].replace(/\D/g, '');
+}
+
+function getOrCreateCustomer(phone) {
+    if (!customers.has(phone)) {
+        customers.set(phone, {
+            memory: {
+                name: null,
+                location: null,
+                service: null,
+                quotation: null,
+                status: 'new',
+                notes: '',
+                lastSummary: '',
+                updatedAt: new Date().toISOString()
+            },
+            history: []
+        });
+    }
+    return customers.get(phone);
+}
+
+function addToHistory(phone, role, content, isHuman = false) {
+    const customer = getOrCreateCustomer(phone);
+    customer.history.push({
+        role,
+        content,
+        isHuman,
+        timestamp: new Date().toISOString()
+    });
+    if (customer.history.length > MAX_HISTORY) {
+        customer.history.splice(0, customer.history.length - MAX_HISTORY);
+    }
+    customer.memory.updatedAt = new Date().toISOString();
+}
 
 function generateMessageID() {
     return crypto.randomBytes(16).toString('hex').toUpperCase();
@@ -67,250 +100,174 @@ async function sendTrackedMessage(sock, jid, content) {
     const messageId = generateMessageID();
     botMessageIds.add(messageId);
     if (botMessageIds.size > 300) {
-        const firstKey = botMessageIds.values().next().value;
-        botMessageIds.delete(firstKey);
+        const first = botMessageIds.values().next().value;
+        botMessageIds.delete(first);
     }
     return sock.sendMessage(jid, content, { messageId });
 }
 
-// Deterministic cleanup applied to every outgoing AI reply
 function sanitizeReply(text) {
     let cleaned = text.replace(/!+/g, '.');
-    cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '');
+    cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
     cleaned = cleaned.replace(/\.{2,}/g, '.').replace(/[ \t]{2,}/g, ' ').trim();
     return cleaned;
 }
 
-// --- STATE PERSISTENCE ---
+// ====== LOAD / SAVE ======
 function loadState() {
     try {
         const raw = fs.readFileSync(STATE_FILE, 'utf8');
         const parsed = JSON.parse(raw);
-        if (parsed.chatHistories) {
-            for (const [key, value] of Object.entries(parsed.chatHistories)) {
-                chatHistories.set(key, value);
+        if (parsed.customers) {
+            for (const [phone, data] of Object.entries(parsed.customers)) {
+                customers.set(phone, data);
             }
         }
         if (parsed.manualMutes) {
-            for (const [key, value] of Object.entries(parsed.manualMutes)) {
-                manualMutes.set(key, value);
+            for (const [k, v] of Object.entries(parsed.manualMutes)) {
+                manualMutes.set(k, v);
             }
         }
-        console.log(`Restored state for ${chatHistories.size} chat(s) from disk.`);
+        console.log(`Restored ${customers.size} customers`);
     } catch (e) {
-        console.log('No previous state file found, starting fresh.');
+        console.log('No previous state, starting fresh');
     }
 }
 
 function saveState() {
     try {
         const data = {
-            chatHistories: Object.fromEntries(chatHistories),
+            customers: Object.fromEntries(customers),
             manualMutes: Object.fromEntries(manualMutes)
         };
-        fs.writeFileSync(STATE_FILE, JSON.stringify(data));
+        fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
     } catch (e) {
-        console.log('[STATE SAVE ERROR]:', e.message);
+        console.log('[SAVE ERROR]', e.message);
     }
 }
 
 loadState();
 
-// --- BUYING INTENT DETECTION & LEAD COUNTING ---
+// ====== LEADS ======
 const BUYING_INTENT_KEYWORDS = [
-    'price', 'cost', 'how much', 'quote', 'quotation',
-    'book', 'order', 'buy', 'purchase', 'interested',
-    'install', 'when can you come', 'available today',
-    'schedule', 'appointment', 'deposit', 'pay'
+    'price', 'cost', 'how much', 'quote', 'quotation', 'book', 'order',
+    'buy', 'purchase', 'interested', 'install', 'schedule', 'appointment', 'deposit', 'pay'
 ];
 
-const AD_LEAD_GREETING = `Hi! 👋 Thanks for your interest in Starlink 🚀
+const AD_LEAD_GREETING = `Hi. Thanks for your interest in Starlink.
 
-Here's our current offer:
-
-📡 Starlink Kit: K8,500
-🔩 Original Starlink Mount: K2,000
-🌐 Monthly Subscription: K800 — Unlimited Data
-🛠️ Professional Installation: K1,500 within Lusaka & Copperbelt`;
+Current offer:
+Starlink Kit: K8,500
+Original Mount: K2,000
+Monthly Unlimited: K800
+Installation: K1,500 within Lusaka & Copperbelt`;
 
 function logLead(sender, text) {
     try {
-        const entry = `${new Date().toISOString()} | ${sender.split('@')[0]} | ${text.replace(/\s+/g, ' ')}\n`;
-        fs.appendFileSync(LEADS_FILE, entry);
-    } catch (e) {
-        console.log('[LEAD LOG ERROR]:', e.message);
-    }
-}
-
-function getLeadCount() {
-    try {
-        if (!fs.existsSync(LEADS_FILE)) return 0;
-        const data = fs.readFileSync(LEADS_FILE, 'utf8');
-        const lines = data.split('\n').filter(line => line.trim() !== '');
-        return lines.length;
-    } catch (e) {
-        console.log('[LEAD COUNT ERROR]:', e.message);
-        return 0;
-    }
+        fs.appendFileSync(LEADS_FILE, `${new Date().toISOString()} | ${getCleanNumber(sender)} | ${text}\n`);
+    } catch (e) {}
 }
 
 async function checkBuyingIntent(sock, sender, text, isMuted, isAdLead = false) {
     const lower = text.toLowerCase();
-    const keywordMatch = BUYING_INTENT_KEYWORDS.some(k => lower.includes(k));
-    const matched = keywordMatch || isAdLead;
-    if (!matched) return;
+    if (!BUYING_INTENT_KEYWORDS.some(k => lower.includes(k)) && !isAdLead) return;
 
     logLead(sender, text);
+    if (isMuted || !OWNER_NOTIFY_NUMBER) return;
 
-    if (isMuted) return;
-    if (!OWNER_NOTIFY_NUMBER) return;
-
-    const lastAlert = lastLeadAlert.get(sender) || 0;
-    if (Date.now() - lastAlert < LEAD_ALERT_COOLDOWN) return;
+    const last = lastLeadAlert.get(sender) || 0;
+    if (Date.now() - last < LEAD_ALERT_COOLDOWN) return;
     lastLeadAlert.set(sender, Date.now());
 
-    const clientNumber = sender.split('@')[0];
-    const alertText = `New potential sale\nClient: ${clientNumber}\nMessage: "${text}"\n\nReply in their chat directly to take over.`;
-
     try {
-        await sendTrackedMessage(sock, OWNER_NOTIFY_NUMBER, { text: alertText });
-    } catch (e) {
-        console.log('[OWNER ALERT ERROR]:', e.message);
-    }
+        await sendTrackedMessage(sock, OWNER_NOTIFY_NUMBER, {
+            text: `New potential sale\nClient: ${getCleanNumber(sender)}\nMessage: ${text}`
+        });
+    } catch (e) {}
 }
 
-// --- AI GENERATION ENGINE ---
-async function generateAIResponse(senderNumber, userMessage, isAdLead = false) {
-    if (!chatHistories.has(senderNumber)) chatHistories.set(senderNumber, []);
-    const history = chatHistories.get(senderNumber);
+// ====== AI ======
+async function generateAIResponse(phone, userMessage, isAdLead = false) {
+    const customer = getOrCreateCustomer(phone);
+    const memory = customer.memory;
 
-    history.push({ role: 'user', content: userMessage });
-    if (history.length > MAX_RAW_HISTORY) {
-        history.splice(0, history.length - MAX_RAW_HISTORY);
+    // Recent history (includes human messages)
+    const recent = customer.history.slice(-MAX_HISTORY).map(h => ({
+        role: h.role,
+        content: h.content
+    }));
+
+    // Ensure latest message is present
+    if (recent.length === 0 || recent[recent.length - 1].content !== userMessage) {
+        recent.push({ role: 'user', content: userMessage });
     }
 
-    const sanitizedHistory = [];
-    for (const msg of history) {
-        const last = sanitizedHistory[sanitizedHistory.length - 1];
-        if (!last || last.role !== msg.role) {
-            sanitizedHistory.push(msg);
-        }
-    }
-    while (sanitizedHistory.length > 8) sanitizedHistory.shift();
-
-    const nowZambia = new Date(new Date().toLocaleString("en-US", { timeZone: "Africa/Lusaka" }));
-    const currentHour = nowZambia.getHours();
-
-    let timeOfDay = "evening";
-    if (currentHour >= 5 && currentHour < 12) {
-        timeOfDay = "morning";
-    } else if (currentHour >= 12 && currentHour < 17) {
-        timeOfDay = "afternoon";
-    } else {
-        timeOfDay = "evening";
+    // Build memory block
+    let memoryBlock = 'CUSTOMER MEMORY:\n';
+    if (memory.name) memoryBlock += `Name: ${memory.name}\n`;
+    if (memory.location) memoryBlock += `Location: ${memory.location}\n`;
+    if (memory.service) memoryBlock += `Service: ${memory.service}\n`;
+    if (memory.quotation) memoryBlock += `Quotation: ${memory.quotation}\n`;
+    if (memory.status) memoryBlock += `Status: ${memory.status}\n`;
+    if (memory.notes) memoryBlock += `Notes: ${memory.notes}\n`;
+    if (memory.lastSummary) memoryBlock += `Last summary: ${memory.lastSummary}\n`;
+    if (memoryBlock === 'CUSTOMER MEMORY:\n') {
+        memoryBlock += 'No previous information stored yet.\n';
     }
 
-    const timeContextString = `[REAL-TIME CONTEXT: The current year is 2026. The current local time in Zambia is ${nowZambia.toLocaleTimeString()} and it is currently ${timeOfDay}. Adjust any time-based greetings to match this exact time.]`;
+    const systemPrompt = `You are a professional human representative of Sovet Link Technologies (Zambia).
+Keep replies short (1-2 sentences maximum).
 
-    if (sanitizedHistory.length > 0) {
-        const lastIndex = sanitizedHistory.length - 1;
-        const lastEntry = sanitizedHistory[lastIndex];
-        if (lastEntry.role === 'user') {
-            const contextPrefix = isAdLead
-                ? `${timeContextString} [SYSTEM CONTEXT: The customer just clicked our Starlink Facebook/Instagram advertisement. IMMEDIATELY answer them by pitching our Starlink packages.] `
-                : `${timeContextString} `;
-            sanitizedHistory[lastIndex] = { role: lastEntry.role, content: contextPrefix + lastEntry.content };
-        }
-    }
+${memoryBlock}
 
-    const systemPrompt = `You are a professional, friendly human representative for Sovet Link Technologies on WhatsApp. All prices are in Zambian Kwacha (k).
-Keep every reply SHORT: one short sentence is ideal, two only if truly necessary. Never chain multiple facts together with commas or "and" into one long sentence, if you have two things to say, send them as two short back-to-back sentences instead. Talk like a real person quickly typing on a phone, not a brochure.
+STRICT RULES:
+- Never use emojis or exclamation marks.
+- Never invent prices, links, or past conversations.
+- If the customer refers to a previous discussion, quotation, installation or anything that is NOT in the Customer Memory and NOT in the recent messages, reply exactly:
+  "Let me connect you with the team so they can assist you properly."
+- Before giving installation price you must know the city.
+- Pricing:
+  Lusaka / Eastern: K1,500 service + K2,000 mount if needed
+  Kitwe / Copperbelt: K2,000 installation
+  Other areas: special arrangement needed
+- Packages: Gen 3 Kit K8,500 | Mini K6,500 | Mount K2,000 | Monthly K800
+- Payment: Airtel Money or bank transfer only.
+- Match a calm, professional tone.
 
-TIME AWARENESS RULE:
-- Pay close attention to the real-time context provided in the message. Never say "Good morning" if it is afternoon or evening. Match your greetings to the actual time of day (morning, afternoon, or evening) or skip greetings entirely and answer directly.
+${isAdLead ? 'This is an ad lead – briefly introduce the Starlink options.' : ''}`;
 
-STRICT GREETING RULE (NATURAL CONVERSATION):
-- If a customer simply says "hello", "hi", or offers a basic greeting, DO NOT instantly start selling Starlink or listing prices.
-- Respond naturally with something like "Hi, how may we help you?" or "Hello, how can we assist you today?"
-- Wait for them to state what they are looking for before pitching products.
-
-CRITICAL AD HANDLING RULE:
-- If a customer contacts us from an ad (e.g. asking "Can I get more info on this?", "Hi! Please let us know how we can help you", or sending an ad template message), IMMEDIATELY recognize they came from our Starlink advert.
-- Briefly introduce the Starlink options right away.
-
-ACCEPTED PAYMENT METHODS:
-- We currently accept Airtel Money and bank transfers.
-- NEVER promise or mention a "payment confirmation link" or automated checkout links.
-
-ANTI-HALLUCINATION & OPERATIONAL LIMITS:
-- YOU CANNOT SEND EMAILS, generate PDFs, or create official documents.
-- NEVER invent or send any links, especially payment links.
-- NEVER invent a physical shop address or walk-in location.
-
-ESCALATION FOR QUESTIONS YOU CANNOT ANSWER:
-- If a customer asks something highly custom or technical that you cannot answer accurately or confidently, apologize briefly and do not guess at an answer.
-${OWNER_DIRECT_LINE ? `- Give them this number to call directly for help: ${OWNER_DIRECT_LINE}.` : `- Let them know a human representative will follow up with them directly.`}
-
-MANDATORY LOCATION & PRICING MATRIX:
-1. BEFORE quoting any installation fees, you MUST ask the customer what city or location they are in.
-2. IF LUSAKA OR EASTERN PROVINCE: Apply a k1,500 service charge + the k2,000 standard installation fee.
-3. IF KITWE DISTRICT / COPPERBELT: Apply the k2,000 installation fee.
-4. IF OUTSIDE LUSAKA OR COPPERBELT (Mpika, Solwezi, remote/distant areas): Tell them we can still supply the Starlink kit. Offer two options: 1) We send the kit to their location and guide them through installation remotely, OR 2) We discuss arranging a professional installer in their area. Ask for their specific town/location so we can advise on the best option. NEVER say "set it up yourself like DSTV".
-5. If a remote customer or corporate organization INSISTS on a physical team coming out, state that transport and logistics fees will apply, and say you will have management prepare a formal custom quotation.
-
-STARLINK PACKAGES:
-- Standard Gen 3 Kit: k8,500 (ideal for home and business, 20-25m coverage)
-- Mini Starlink: k6,500 (portable/traveling, 20-25m coverage)
-- Original Mount: k2,000
-- Monthly Unlimited Data: k800
-
-STRICT GENERAL RULES:
-1. Never use robotic corporate intros.
-2. Do not bombard customers with long lists of prices unless explicitly asked.
-3. If you don't know an exact price for a custom setup (like CCTV), say: "I can have our team calculate a quote for your setup and get back to you shortly."
-4. Never use exclamation marks or emojis.
-5. Do not repeat a price or fact you have already stated earlier in this conversation.`;
-
-  // 1. PRIMARY: GEMINI API
+    // Gemini
     if (GEMINI_API_KEY) {
         try {
-            const geminiPayload = {
+            const payload = {
                 system_instruction: { parts: [{ text: systemPrompt }] },
-                contents: sanitizedHistory.map(h => ({
+                contents: recent.map(h => ({
                     role: h.role === 'assistant' ? 'model' : 'user',
                     parts: [{ text: h.content }]
                 }))
             };
 
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(geminiPayload)
-            });
-
-            const rawText = await response.text();
-            let data;
-            try { data = JSON.parse(rawText); } catch (e) {}
-
-            if (response.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-                const reply = data.candidates[0].content.parts[0].text.trim();
-                history.push({ role: 'assistant', content: reply });
-                return reply;
+            const res = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }
+            );
+            const data = await res.json();
+            if (res.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+                return data.candidates[0].content.parts[0].text.trim();
             }
-        } catch (err) {
-            console.log('[GEMINI EXCEPTION]:', err.message);
+        } catch (e) {
+            console.log('[GEMINI]', e.message);
         }
     }
 
-    // 2. SECONDARY: NVIDIA API
+    // NVIDIA fallback
     if (NVIDIA_API_KEY) {
         try {
-            const nvidiaMessages = [
-                { role: 'system', content: systemPrompt },
-                ...sanitizedHistory
-            ];
-
-            const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+            const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -318,46 +275,32 @@ STRICT GENERAL RULES:
                 },
                 body: JSON.stringify({
                     model: 'meta/llama-3.1-8b-instruct',
-                    messages: nvidiaMessages,
-                    max_tokens: 150,
-                    temperature: 0.7
+                    messages: [{ role: 'system', content: systemPrompt }, ...recent],
+                    max_tokens: 120,
+                    temperature: 0.5
                 })
             });
-
-            const rawText = await response.text();
-            let data;
-            try { data = JSON.parse(rawText); } catch (e) {}
-
-            if (response.ok && data?.choices?.[0]?.message?.content) {
-                const reply = data.choices[0].message.content.trim();
-                history.push({ role: 'assistant', content: reply });
-                return reply;
+            const data = await res.json();
+            if (res.ok && data?.choices?.[0]?.message?.content) {
+                return data.choices[0].message.content.trim();
             }
-        } catch (err) {
-            console.log('[NVIDIA EXCEPTION]:', err.message);
+        } catch (e) {
+            console.log('[NVIDIA]', e.message);
         }
     }
 
-    // 3. FALLBACK: LOCAL KEYWORDS
+    // Simple fallback
     const lower = userMessage.toLowerCase();
-    let fallbackReply;
     if (isAdLead || lower.includes('starlink')) {
-        fallbackReply = "We have Starlink Gen 3 at k8,500 and Starlink Mini at k6,500 available. Which setup are you looking for.";
-    } else if (lower.includes('cctv') || lower.includes('camera') || lower.includes('security')) {
-        fallbackReply = "We install HD CCTV cameras with remote phone viewing. Want a quick quote.";
-    } else if (lower.includes('price') || lower.includes('cost') || lower.includes('how much') || lower.includes('install')) {
-        fallbackReply = "Our installation pricing depends on your exact location. Which city are you located in.";
-    } else if (lower.includes('pay') || lower.includes('payment') || lower.includes('airtel') || lower.includes('bank')) {
-        fallbackReply = "We currently accept Airtel Money and bank transfers.";
-    } else {
-        fallbackReply = "Hello. How can we assist you with your internet or IT setup today.";
+        return 'We have Starlink Gen 3 at K8,500 and Mini at K6,500. Which one are you interested in.';
     }
-
-    history.push({ role: 'assistant', content: fallbackReply });
-    return fallbackReply;
+    if (lower.includes('price') || lower.includes('cost') || lower.includes('how much')) {
+        return 'Pricing depends on your location. Which city are you in.';
+    }
+    return 'Hello. How can we help you today.';
 }
 
-// --- WHATSAPP BOT CORE ---
+// ====== BOT ======
 async function startBot() {
     if (currentSock) {
         try { currentSock.end(undefined); } catch (e) {}
@@ -372,12 +315,35 @@ async function startBot() {
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
         browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: false
+        syncFullHistory: true                 // Option C
     });
 
     currentSock = sock;
-
     sock.ev.on('creds.update', saveCreds);
+
+    // Try to receive older messages (Option C)
+    sock.ev.on('messaging-history.set', ({ messages }) => {
+        if (!messages || !messages.length) return;
+        console.log(`History sync received: ${messages.length} messages`);
+
+        for (const msg of messages) {
+            try {
+                const jid = msg.key?.remoteJid;
+                if (!jid || jid.endsWith('@g.us')) continue;
+
+                const phone = getCleanNumber(jid);
+                if (!phone) continue;
+
+                const text = msg.message?.conversation ||
+                             msg.message?.extendedTextMessage?.text ||
+                             msg.message?.imageMessage?.caption;
+                if (!text) continue;
+
+                addToHistory(phone, msg.key.fromMe ? 'assistant' : 'user', text, !!msg.key.fromMe);
+            } catch (e) {}
+        }
+        saveState();
+    });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -386,21 +352,20 @@ async function startBot() {
             qrcode.toDataURL(qr, (err, url) => {
                 if (!err) {
                     qrCodeDataUrl = url;
-                    console.log('New QR code generated successfully.');
+                    console.log('QR ready');
                 }
             });
         }
 
         if (connection === 'open') {
-            console.log('Bot connected to WhatsApp successfully.');
+            console.log('Connected to WhatsApp');
             isConnected = true;
             qrCodeDataUrl = '';
         } else if (connection === 'close') {
             isConnected = false;
-            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log('Connection closed. Status code:', statusCode);
-
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 405 || statusCode === 401 || statusCode === 440) {
+            const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            console.log('Disconnected:', code);
+            if ([DisconnectReason.loggedOut, 401, 403, 405].includes(code)) {
                 try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
             }
             setTimeout(startBot, 4000);
@@ -412,93 +377,106 @@ async function startBot() {
         if (!msg.message) return;
 
         const sender = msg.key.remoteJid;
+        if (!sender || sender.endsWith('@g.us')) return;
 
+        const phone = getCleanNumber(sender);
+        if (!phone) return;
+
+        const text = msg.message.conversation ||
+                     msg.message.extendedTextMessage?.text ||
+                     msg.message.imageMessage?.caption;
+
+        // ========== HUMAN MESSAGE ==========
         if (msg.key.fromMe) {
-            if (sender && msg.key.id) {
-                if (botMessageIds.has(msg.key.id)) return;
+            if (botMessageIds.has(msg.key.id)) return;
+
+            if (text) {
+                addToHistory(phone, 'assistant', text, true);   // SAVE human message
                 manualMutes.set(sender, Date.now());
                 saveState();
-                console.log(`Human agent replied manually to ${sender}. Bot muted for 30 minutes.`);
+                console.log(`Human message saved for ${phone}`);
             }
             return;
         }
 
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+        // ========== CUSTOMER MESSAGE ==========
         if (!text) return;
 
         try { await sock.readMessages([msg.key]); } catch (e) {}
 
-        const cleanText = text.trim().toLowerCase();
+        const lower = text.trim().toLowerCase();
+        const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/\D/g, ''));
 
-        if (cleanText === '/human') {
-            manualMutes.set(sender, Date.now());
-            saveState();
-            await sendTrackedMessage(sock, sender, { text: "AI Assistant paused. You are now connected directly to a human representative." });
-            return;
-        }
-
-        if (cleanText === '/number of leads' || cleanText === 'number of leads') {
-            const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/[^0-9]/g, ''));
-            if (isOwner) {
-                const totalLeads = getLeadCount();
-                await sendTrackedMessage(sock, sender, { text: `Total recorded leads: ${totalLeads}` });
+        // Manual seeding (Option B)
+        if (isOwner && lower.startsWith('/note ')) {
+            const parts = text.trim().slice(6).split(' ');
+            const target = parts[0].replace(/\D/g, '');
+            const note = parts.slice(1).join(' ');
+            if (target && note) {
+                const c = getOrCreateCustomer(target);
+                c.memory.notes = c.memory.notes ? c.memory.notes + ' | ' + note : note;
+                c.memory.updatedAt = new Date().toISOString();
+                saveState();
+                await sendTrackedMessage(sock, sender, { text: `Note saved for ${target}` });
             }
             return;
         }
 
-const lowerText = text.toLowerCase();
+        // Save customer message
+        addToHistory(phone, 'user', text, false);
 
-        const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
-        const hasAdContextMetadata = !!(contextInfo?.externalAdReply || contextInfo?.adReplyInfo);
-        const isAdTemplateText = lowerText.includes('can i get more info on this') || lowerText.includes('please let us know how we can help you');
-        const isAdLead = hasAdContextMetadata || isAdTemplateText;
-
-        const lastMuted = manualMutes.get(sender) || 0;
-        const isMuted = Date.now() - lastMuted < MUTE_DURATION;
-
-        await checkBuyingIntent(sock, sender, text, isMuted, isAdLead);
-
-        if (isMuted) return;
-
-        if (lowerText.includes('owner') || lowerText.includes('human') || lowerText.includes('talk to someone')) {
+        if (lower === '/human') {
             manualMutes.set(sender, Date.now());
             saveState();
-            await sendTrackedMessage(sock, sender, { text: "I have connected you with our team. Someone will be with you shortly." });
+            await sendTrackedMessage(sock, sender, { text: 'AI paused. You are now connected with the team.' });
             return;
         }
 
-        if (lowerText.includes('can i get more info on this')) {
-            const typingDelay = Math.min(Math.max(AD_LEAD_GREETING.length * 20, 1500), 4000);
-            await sock.sendPresenceUpdate('composing', sender);
-            await new Promise(resolve => setTimeout(resolve, typingDelay));
-            await sock.sendPresenceUpdate('paused', sender);
-            await sendTrackedMessage(sock, sender, { text: AD_LEAD_GREETING });
+        // Ad detection
+        const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
+        const isAdLead = !!(ctx?.externalAdReply || ctx?.adReplyInfo) ||
+                         lower.includes('can i get more info on this');
 
-            if (!chatHistories.has(sender)) chatHistories.set(sender, []);
-            const history = chatHistories.get(sender);
-            history.push({ role: 'user', content: text });
-            history.push({ role: 'assistant', content: AD_LEAD_GREETING });
-            if (history.length > MAX_RAW_HISTORY) history.splice(0, history.length - MAX_RAW_HISTORY);
+        const isMuted = Date.now() - (manualMutes.get(sender) || 0) < MUTE_DURATION;
+
+        await checkBuyingIntent(sock, sender, text, isMuted, isAdLead);
+        if (isMuted) return;
+
+        if (lower.includes('owner') || lower.includes('human') || lower.includes('talk to someone')) {
+            manualMutes.set(sender, Date.now());
+            saveState();
+            await sendTrackedMessage(sock, sender, { text: 'I have connected you with the team.' });
+            return;
+        }
+
+        if (lower.includes('can i get more info on this')) {
+            await sock.sendPresenceUpdate('composing', sender);
+            await new Promise(r => setTimeout(r, 1800));
+            await sendTrackedMessage(sock, sender, { text: AD_LEAD_GREETING });
+            addToHistory(phone, 'assistant', AD_LEAD_GREETING, false);
             saveState();
             return;
         }
 
-        console.log(`Received message from ${sender}: "${text}" (AdLead: ${isAdLead})`);
+        console.log(`From ${phone}: ${text}`);
 
         await sock.sendPresenceUpdate('composing', sender);
 
-        const rawReply = await generateAIResponse(sender, text, isAdLead);
-        const replyText = sanitizeReply(rawReply);
+        const raw = await generateAIResponse(phone, text, isAdLead);
+        const reply = sanitizeReply(raw);
+
+        // Auto-mute if AI decided to hand over
+        if (reply.toLowerCase().includes('connect you with the team')) {
+            manualMutes.set(sender, Date.now());
+        }
+
+        addToHistory(phone, 'assistant', reply, false);
         saveState();
 
-        const typingDelay = Math.min(Math.max(replyText.length * 20, 1500), 4000);
-        await new Promise(resolve => setTimeout(resolve, typingDelay));
-
+        await new Promise(r => setTimeout(r, Math.min(Math.max(reply.length * 18, 1200), 3200)));
         await sock.sendPresenceUpdate('paused', sender);
-        await sendTrackedMessage(sock, sender, { text: replyText });
+        await sendTrackedMessage(sock, sender, { text: reply });
     });
 }
 
 startBot();
-
-
