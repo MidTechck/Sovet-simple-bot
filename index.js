@@ -8,19 +8,27 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// ====== ENV ======
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || '';
 const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER || '';
 const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE || '';
 
-// ====== STORAGE (Railway volume) ======
+const GEMINI_MODELS = [
+    'gemini-2.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.7-flash'
+];
+
+const NVIDIA_MODELS = [
+    'meta/llama-3.1-8b-instruct',
+    'nvidia/llama-3.1-nemotron-nano-8b-v1'
+];
+
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
 const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
 const LEADS_FILE = path.join(DATA_DIR, 'leads.log');
 
-// ====== WEB SERVER (QR) ======
 const app = express();
 const PORT = process.env.PORT || 8080;
 let qrCodeDataUrl = '';
@@ -45,18 +53,37 @@ app.get('/', (req, res) => {
 });
 app.listen(PORT, () => console.log(`Web server on port ${PORT}`));
 
-// ====== STATE ======
 const manualMutes = new Map();
 const MUTE_DURATION = 30 * 60 * 1000;
-const customers = new Map();          // phone → { memory, history }
+const customers = new Map();
 const MAX_HISTORY = 12;
 const botMessageIds = new Set();
 const lastLeadAlert = new Map();
 const LEAD_ALERT_COOLDOWN = 20 * 60 * 1000;
 
-function getCleanNumber(jid) {
-    if (!jid) return null;
-    return jid.split('@')[0].replace(/\D/g, '');
+function digitsOnly(value) {
+    return String(value || '').replace(/\D/g, '');
+}
+
+function getPhoneFromMessage(msg) {
+    const key = msg?.key || {};
+    const candidates = [
+        key.remoteJidAlt,
+        key.senderPn,
+        key.participantPn,
+        key.remoteJid,
+        msg.senderPn
+    ];
+
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (String(candidate).endsWith('@g.us')) continue;
+        const digits = digitsOnly(candidate);
+        if (digits.length >= 10 && digits.length <= 15) return digits;
+    }
+
+    const fallback = digitsOnly(key.remoteJid);
+    return fallback || null;
 }
 
 function getOrCreateCustomer(phone) {
@@ -79,7 +106,11 @@ function getOrCreateCustomer(phone) {
 }
 
 function addToHistory(phone, role, content, isHuman = false) {
+    if (!phone || !content) return;
     const customer = getOrCreateCustomer(phone);
+    const last = customer.history[customer.history.length - 1];
+    if (last && last.role === role && last.content === content) return;
+
     customer.history.push({
         role,
         content,
@@ -107,13 +138,12 @@ async function sendTrackedMessage(sock, jid, content) {
 }
 
 function sanitizeReply(text) {
-    let cleaned = text.replace(/!+/g, '.');
+    let cleaned = String(text || '').replace(/!+/g, '.');
     cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
     cleaned = cleaned.replace(/\.{2,}/g, '.').replace(/[ \t]{2,}/g, ' ').trim();
     return cleaned;
 }
 
-// ====== LOAD / SAVE ======
 function loadState() {
     try {
         const raw = fs.readFileSync(STATE_FILE, 'utf8');
@@ -148,7 +178,6 @@ function saveState() {
 
 loadState();
 
-// ====== LEADS ======
 const BUYING_INTENT_KEYWORDS = [
     'price', 'cost', 'how much', 'quote', 'quotation', 'book', 'order',
     'buy', 'purchase', 'interested', 'install', 'schedule', 'appointment', 'deposit', 'pay'
@@ -164,7 +193,7 @@ Installation: K1,500 within Lusaka & Copperbelt`;
 
 function logLead(sender, text) {
     try {
-        fs.appendFileSync(LEADS_FILE, `${new Date().toISOString()} | ${getCleanNumber(sender)} | ${text}\n`);
+        fs.appendFileSync(LEADS_FILE, `${new Date().toISOString()} | ${digitsOnly(sender)} | ${text}\n`);
     } catch (e) {}
 }
 
@@ -181,91 +210,109 @@ async function checkBuyingIntent(sock, sender, text, isMuted, isAdLead = false) 
 
     try {
         await sendTrackedMessage(sock, OWNER_NOTIFY_NUMBER, {
-            text: `New potential sale\nClient: ${getCleanNumber(sender)}\nMessage: ${text}`
+            text: `New potential sale\nClient: ${digitsOnly(sender)}\nMessage: ${text}`
         });
     } catch (e) {}
 }
 
-// ====== AI ======
-async function generateAIResponse(phone, userMessage, isAdLead = false) {
+function buildRecentHistory(phone, userMessage) {
     const customer = getOrCreateCustomer(phone);
-    const memory = customer.memory;
-
-    // Recent history (includes human messages)
     const recent = customer.history.slice(-MAX_HISTORY).map(h => ({
         role: h.role,
         content: h.content
     }));
-
-    // Ensure latest message is present
     if (recent.length === 0 || recent[recent.length - 1].content !== userMessage) {
         recent.push({ role: 'user', content: userMessage });
     }
+    return recent;
+}
 
-    // Build memory block
-    let memoryBlock = 'CUSTOMER MEMORY:\n';
-    if (memory.name) memoryBlock += `Name: ${memory.name}\n`;
-    if (memory.location) memoryBlock += `Location: ${memory.location}\n`;
-    if (memory.service) memoryBlock += `Service: ${memory.service}\n`;
-    if (memory.quotation) memoryBlock += `Quotation: ${memory.quotation}\n`;
-    if (memory.status) memoryBlock += `Status: ${memory.status}\n`;
-    if (memory.notes) memoryBlock += `Notes: ${memory.notes}\n`;
-    if (memory.lastSummary) memoryBlock += `Last summary: ${memory.lastSummary}\n`;
-    if (memoryBlock === 'CUSTOMER MEMORY:\n') {
-        memoryBlock += 'No previous information stored yet.\n';
+function buildMemoryBlock(phone) {
+    const memory = getOrCreateCustomer(phone).memory;
+    let block = 'CUSTOMER MEMORY:\n';
+    if (memory.name) block += `Name: ${memory.name}\n`;
+    if (memory.location) block += `Location: ${memory.location}\n`;
+    if (memory.service) block += `Service: ${memory.service}\n`;
+    if (memory.quotation) block += `Quotation: ${memory.quotation}\n`;
+    if (memory.status) block += `Status: ${memory.status}\n`;
+    if (memory.notes) block += `Notes: ${memory.notes}\n`;
+    if (memory.lastSummary) block += `Last summary: ${memory.lastSummary}\n`;
+    if (block === 'CUSTOMER MEMORY:\n') block += 'No previous information stored yet.\n';
+    return block;
+}
+
+function smartFallback(phone, userMessage, isAdLead) {
+    const recent = buildRecentHistory(phone, userMessage);
+    const joined = recent.map(m => m.content).join(' ').toLowerCase();
+    const current = userMessage.toLowerCase();
+
+    if (isAdLead || joined.includes('starlink') || current.includes('gen 3') || current.includes('mini')) {
+        if (current.includes('mini')) return 'Starlink Mini is K6,500. Installation depends on your city. Are you in Lusaka or Copperbelt.';
+        if (current.includes('gen 3') || joined.includes('gen 3')) {
+            if (joined.includes('lusaka')) return 'Starlink Gen 3 is K8,500. In Lusaka installation is K1,500 and the original mount is K2,000. Should I continue with that package.';
+            return 'Starlink Gen 3 is K8,500. Which city are you in so I can confirm the installation fee.';
+        }
+        return 'We have Starlink Gen 3 at K8,500 and Mini at K6,500. Which one are you interested in.';
+    }
+    if (current.includes('price') || current.includes('cost') || current.includes('how much')) {
+        return 'Pricing depends on your location. Which city are you in.';
+    }
+    if (recent.length > 1) {
+        return 'Yes, I am still with you. Please continue.';
+    }
+    return 'Hello. How can we help you today.';
+}
+
+async function callGemini(systemPrompt, recent) {
+    if (!GEMINI_API_KEY) {
+        console.log('[GEMINI] No API key set');
+        return null;
     }
 
-    const systemPrompt = `You are a professional human representative of Sovet Link Technologies (Zambia).
-Keep replies short (1-2 sentences maximum).
+    const payload = {
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents: recent.map(h => ({
+            role: h.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: h.content }]
+        }))
+    };
 
-${memoryBlock}
-
-STRICT RULES:
-- Never use emojis or exclamation marks.
-- Never invent prices, links, or past conversations.
-- If the customer refers to a previous discussion, quotation, installation or anything that is NOT in the Customer Memory and NOT in the recent messages, reply exactly:
-  "Let me connect you with the team so they can assist you properly."
-- Before giving installation price you must know the city.
-- Pricing:
-  Lusaka / Eastern: K1,500 service + K2,000 mount if needed
-  Kitwe / Copperbelt: K2,000 installation
-  Other areas: special arrangement needed
-- Packages: Gen 3 Kit K8,500 | Mini K6,500 | Mount K2,000 | Monthly K800
-- Payment: Airtel Money or bank transfer only.
-- Match a calm, professional tone.
-
-${isAdLead ? 'This is an ad lead – briefly introduce the Starlink options.' : ''}`;
-
-    // Gemini
-    if (GEMINI_API_KEY) {
+    for (const model of GEMINI_MODELS) {
         try {
-            const payload = {
-                system_instruction: { parts: [{ text: systemPrompt }] },
-                contents: recent.map(h => ({
-                    role: h.role === 'assistant' ? 'model' : 'user',
-                    parts: [{ text: h.content }]
-                }))
-            };
-
             const res = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/\( {model}:generateContent?key= \){GEMINI_API_KEY}`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 }
             );
-            const data = await res.json();
-            if (res.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-                return data.candidates[0].content.parts[0].text.trim();
+            const raw = await res.text();
+            let data = {};
+            try { data = JSON.parse(raw); } catch (e) {}
+
+            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (res.ok && text) {
+                console.log(`[GEMINI] Success with ${model}`);
+                return text.trim();
             }
+            console.log(`[GEMINI] ${model} failed: ${res.status} ${raw.slice(0, 250)}`);
         } catch (e) {
-            console.log('[GEMINI]', e.message);
+            console.log(`[GEMINI] ${model} exception:`, e.message);
         }
     }
+    return null;
+}
 
-    // NVIDIA fallback
-    if (NVIDIA_API_KEY) {
+async function callNvidia(systemPrompt, recent) {
+    if (!NVIDIA_API_KEY) {
+        console.log('[NVIDIA] No API key set');
+        return null;
+    }
+
+    const messages = [{ role: 'system', content: systemPrompt }, ...recent];
+
+    for (const model of NVIDIA_MODELS) {
         try {
             const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
                 method: 'POST',
@@ -274,33 +321,66 @@ ${isAdLead ? 'This is an ad lead – briefly introduce the Starlink options.' : 
                     'Authorization': `Bearer ${NVIDIA_API_KEY}`
                 },
                 body: JSON.stringify({
-                    model: 'meta/llama-3.1-8b-instruct',
-                    messages: [{ role: 'system', content: systemPrompt }, ...recent],
-                    max_tokens: 120,
-                    temperature: 0.5
+                    model,
+                    messages,
+                    max_tokens: 150,
+                    temperature: 0.4
                 })
             });
-            const data = await res.json();
-            if (res.ok && data?.choices?.[0]?.message?.content) {
-                return data.choices[0].message.content.trim();
+            const raw = await res.text();
+            let data = {};
+            try { data = JSON.parse(raw); } catch (e) {}
+
+            const text = data?.choices?.[0]?.message?.content;
+            if (res.ok && text) {
+                console.log(`[NVIDIA] Success with ${model}`);
+                return text.trim();
             }
+            console.log(`[NVIDIA] ${model} failed: ${res.status} ${raw.slice(0, 250)}`);
         } catch (e) {
-            console.log('[NVIDIA]', e.message);
+            console.log(`[NVIDIA] ${model} exception:`, e.message);
         }
     }
-
-    // Simple fallback
-    const lower = userMessage.toLowerCase();
-    if (isAdLead || lower.includes('starlink')) {
-        return 'We have Starlink Gen 3 at K8,500 and Mini at K6,500. Which one are you interested in.';
-    }
-    if (lower.includes('price') || lower.includes('cost') || lower.includes('how much')) {
-        return 'Pricing depends on your location. Which city are you in.';
-    }
-    return 'Hello. How can we help you today.';
+    return null;
 }
 
-// ====== BOT ======
+async function generateAIResponse(phone, userMessage, isAdLead = false) {
+    const recent = buildRecentHistory(phone, userMessage);
+    const memoryBlock = buildMemoryBlock(phone);
+
+    const systemPrompt = `You are a professional human representative of Sovet Link Technologies in Zambia.
+Keep replies short: 1 or 2 sentences only.
+
+${memoryBlock}
+
+Use the recent conversation. Do not restart the chat.
+If the customer already said they want Starlink Gen 3, continue from that. Do not say hello again.
+
+STRICT RULES:
+- Never use emojis or exclamation marks.
+- Never invent prices, links, or past conversations.
+- If the customer refers to a previous discussion that is NOT in memory and NOT in recent messages, reply exactly:
+  "Let me connect you with the team so they can assist you properly."
+- Before giving installation price you must know the city.
+- Pricing:
+  Lusaka / Eastern: K1,500 service + K2,000 mount if needed
+  Kitwe / Copperbelt: K2,000 installation
+  Other areas: special arrangement needed
+- Packages: Gen 3 Kit K8,500 | Mini K6,500 | Mount K2,000 | Monthly K800
+- Payment: Airtel Money or bank transfer only.
+${OWNER_DIRECT_LINE ? `- If handing over, they can also call ${OWNER_DIRECT_LINE}.` : ''}
+${isAdLead ? 'This is an ad lead. Briefly introduce the Starlink options.' : ''}`;
+
+    const geminiReply = await callGemini(systemPrompt, recent);
+    if (geminiReply) return geminiReply;
+
+    const nvidiaReply = await callNvidia(systemPrompt, recent);
+    if (nvidiaReply) return nvidiaReply;
+
+    console.log('[AI] Both APIs failed, using smart fallback');
+    return smartFallback(phone, userMessage, isAdLead);
+}
+
 async function startBot() {
     if (currentSock) {
         try { currentSock.end(undefined); } catch (e) {}
@@ -315,24 +395,24 @@ async function startBot() {
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
         browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: true                 // Option C
+        syncFullHistory: true
     });
 
     currentSock = sock;
     sock.ev.on('creds.update', saveCreds);
 
-    // Try to receive older messages (Option C)
     sock.ev.on('messaging-history.set', ({ messages }) => {
         if (!messages || !messages.length) return;
         console.log(`History sync received: ${messages.length} messages`);
 
+        let stored = 0;
         for (const msg of messages) {
             try {
-                const jid = msg.key?.remoteJid;
-                if (!jid || jid.endsWith('@g.us')) continue;
-
-                const phone = getCleanNumber(jid);
+                const phone = getPhoneFromMessage(msg);
                 if (!phone) continue;
+
+                const customer = getOrCreateCustomer(phone);
+                if (customer.history.length >= MAX_HISTORY) continue;
 
                 const text = msg.message?.conversation ||
                              msg.message?.extendedTextMessage?.text ||
@@ -340,9 +420,10 @@ async function startBot() {
                 if (!text) continue;
 
                 addToHistory(phone, msg.key.fromMe ? 'assistant' : 'user', text, !!msg.key.fromMe);
+                stored += 1;
             } catch (e) {}
         }
-        saveState();
+        if (stored) saveState();
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -379,19 +460,17 @@ async function startBot() {
         const sender = msg.key.remoteJid;
         if (!sender || sender.endsWith('@g.us')) return;
 
-        const phone = getCleanNumber(sender);
+        const phone = getPhoneFromMessage(msg);
         if (!phone) return;
 
         const text = msg.message.conversation ||
                      msg.message.extendedTextMessage?.text ||
                      msg.message.imageMessage?.caption;
 
-        // ========== HUMAN MESSAGE ==========
         if (msg.key.fromMe) {
             if (botMessageIds.has(msg.key.id)) return;
-
             if (text) {
-                addToHistory(phone, 'assistant', text, true);   // SAVE human message
+                addToHistory(phone, 'assistant', text, true);
                 manualMutes.set(sender, Date.now());
                 saveState();
                 console.log(`Human message saved for ${phone}`);
@@ -399,18 +478,15 @@ async function startBot() {
             return;
         }
 
-        // ========== CUSTOMER MESSAGE ==========
         if (!text) return;
-
         try { await sock.readMessages([msg.key]); } catch (e) {}
 
         const lower = text.trim().toLowerCase();
-        const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(OWNER_NOTIFY_NUMBER.replace(/\D/g, ''));
+        const isOwner = OWNER_NOTIFY_NUMBER && sender.includes(digitsOnly(OWNER_NOTIFY_NUMBER));
 
-        // Manual seeding (Option B)
         if (isOwner && lower.startsWith('/note ')) {
             const parts = text.trim().slice(6).split(' ');
-            const target = parts[0].replace(/\D/g, '');
+            const target = digitsOnly(parts[0]);
             const note = parts.slice(1).join(' ');
             if (target && note) {
                 const c = getOrCreateCustomer(target);
@@ -422,7 +498,17 @@ async function startBot() {
             return;
         }
 
-        // Save customer message
+        if (isOwner && (lower === '/number of leads' || lower === 'number of leads')) {
+            let total = 0;
+            try {
+                if (fs.existsSync(LEADS_FILE)) {
+                    total = fs.readFileSync(LEADS_FILE, 'utf8').split('\n').filter(l => l.trim()).length;
+                }
+            } catch (e) {}
+            await sendTrackedMessage(sock, sender, { text: `Total recorded leads: ${total}` });
+            return;
+        }
+
         addToHistory(phone, 'user', text, false);
 
         if (lower === '/human') {
@@ -432,13 +518,11 @@ async function startBot() {
             return;
         }
 
-        // Ad detection
         const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo;
         const isAdLead = !!(ctx?.externalAdReply || ctx?.adReplyInfo) ||
                          lower.includes('can i get more info on this');
 
         const isMuted = Date.now() - (manualMutes.get(sender) || 0) < MUTE_DURATION;
-
         await checkBuyingIntent(sock, sender, text, isMuted, isAdLead);
         if (isMuted) return;
 
@@ -458,14 +542,12 @@ async function startBot() {
             return;
         }
 
-        console.log(`From ${phone}: ${text}`);
-
+console.log(`From ${phone}: ${text}`);
         await sock.sendPresenceUpdate('composing', sender);
 
         const raw = await generateAIResponse(phone, text, isAdLead);
         const reply = sanitizeReply(raw);
 
-        // Auto-mute if AI decided to hand over
         if (reply.toLowerCase().includes('connect you with the team')) {
             manualMutes.set(sender, Date.now());
         }
