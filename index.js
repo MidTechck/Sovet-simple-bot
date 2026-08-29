@@ -8,11 +8,14 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || '';
-const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER || '';
-const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : '';
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ? process.env.NVIDIA_API_KEY.trim() : '';
+const OWNER_NOTIFY_NUMBER = process.env.OWNER_NOTIFY_NUMBER ? process.env.OWNER_NOTIFY_NUMBER.trim() : '';
+const OWNER_DIRECT_LINE = process.env.OWNER_DIRECT_LINE ? process.env.OWNER_DIRECT_LINE.trim() : '';
 
+// NOTE: hosted model availability changes often and can be deprecated with only days of notice
+// (this is exactly what killed the old NVIDIA models). Check https://build.nvidia.com/models
+// occasionally and update this list if replies start failing again.
 const GEMINI_MODELS = [
     'gemini-2.5-flash',
     'gemini-3.5-flash-lite',
@@ -20,8 +23,8 @@ const GEMINI_MODELS = [
 ];
 
 const NVIDIA_MODELS = [
-    'meta/llama-3.1-8b-instruct',
-    'nvidia/llama-3.1-nemotron-nano-8b-v1'
+    'nvidia/nemotron-3.5-lightning-30b-a3b',
+    'nvidia/nemotron-3-ultra-550b-a55b'
 ];
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
@@ -44,7 +47,7 @@ app.get('/', (req, res) => {
             <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
             <body style="font-family:Arial;text-align:center;margin-top:40px;">
                 <h2>Scan QR Code with WhatsApp</h2>
-                <p>Linked Devices → Link a Device</p>
+                <p>Linked Devices &rarr; Link a Device</p>
                 <img src="${qrCodeDataUrl}" style="max-width:300px">
             </body></html>
         `);
@@ -137,9 +140,12 @@ async function sendTrackedMessage(sock, jid, content) {
     return sock.sendMessage(jid, content, { messageId });
 }
 
+// Strips exclamation marks and emoji from every AI-generated reply, regardless of which
+// model produced it. The one deliberate exception is AD_LEAD_GREETING below, which is sent
+// directly and never passed through this function, so its emojis survive intact.
 function sanitizeReply(text) {
     let cleaned = String(text || '').replace(/!+/g, '.');
-    cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+    cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '');
     cleaned = cleaned.replace(/\.{2,}/g, '.').replace(/[ \t]{2,}/g, ' ').trim();
     return cleaned;
 }
@@ -183,13 +189,16 @@ const BUYING_INTENT_KEYWORDS = [
     'buy', 'purchase', 'interested', 'install', 'schedule', 'appointment', 'deposit', 'pay'
 ];
 
-const AD_LEAD_GREETING = `Hi. Thanks for your interest in Starlink.
+// Exact canned reply Sovet Link asked for, with emojis, sent verbatim (never through sanitizeReply)
+// so it's guaranteed consistent every time and doesn't depend on any AI model being up.
+const AD_LEAD_GREETING = `Hi! 👋 Thanks for your interest in Starlink 🚀
 
-Current offer:
-Starlink Kit: K8,500
-Original Mount: K2,000
-Monthly Unlimited: K800
-Installation: K1,500 within Lusaka & Copperbelt`;
+Here's our current offer:
+
+📡 Starlink Kit: K8,500
+🔩 Original Starlink Mount: K2,000
+🌐 Monthly Subscription: K800 — Unlimited Data
+🛠️ Professional Installation: K1,500 within Lusaka & Copperbelt`;
 
 function logLead(sender, text) {
     try {
@@ -241,6 +250,17 @@ function buildMemoryBlock(phone) {
     return block;
 }
 
+// Calculates Zambia local time so greetings can match morning/afternoon/evening correctly,
+// and so the AI never opens with "good morning" on an evening message.
+function getZambiaTimeContext() {
+    const nowZambia = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Lusaka' }));
+    const hour = nowZambia.getHours();
+    let timeOfDay = 'evening';
+    if (hour >= 5 && hour < 12) timeOfDay = 'morning';
+    else if (hour >= 12 && hour < 17) timeOfDay = 'afternoon';
+    return `[REAL-TIME CONTEXT: current local time in Zambia is ${nowZambia.toLocaleTimeString()}, it is currently ${timeOfDay}. Match any greeting to this exact time, or skip greeting entirely if the conversation is already underway.]`;
+}
+
 function smartFallback(phone, userMessage, isAdLead) {
     const recent = buildRecentHistory(phone, userMessage);
     const joined = recent.map(m => m.content).join(' ').toLowerCase();
@@ -249,18 +269,21 @@ function smartFallback(phone, userMessage, isAdLead) {
     if (isAdLead || joined.includes('starlink') || current.includes('gen 3') || current.includes('mini')) {
         if (current.includes('mini')) return 'Starlink Mini is K6,500. Installation depends on your city. Are you in Lusaka or Copperbelt.';
         if (current.includes('gen 3') || joined.includes('gen 3')) {
-            if (joined.includes('lusaka')) return 'Starlink Gen 3 is K8,500. In Lusaka installation is K1,500 and the original mount is K2,000. Should I continue with that package.';
-            return 'Starlink Gen 3 is K8,500. Which city are you in so I can confirm the installation fee.';
+            if (joined.includes('lusaka')) return 'In Lusaka, installation is K1,500 plus the K2,000 mount. Should I continue with that.';
+            return 'Which city are you in so I can confirm the installation fee.';
         }
         return 'We have Starlink Gen 3 at K8,500 and Mini at K6,500. Which one are you interested in.';
     }
     if (current.includes('price') || current.includes('cost') || current.includes('how much')) {
         return 'Pricing depends on your location. Which city are you in.';
     }
+    if (/\b(hi|hello|hey|morning|afternoon|evening)\b/.test(current) && recent.length <= 1) {
+        return 'Hi, how may we help you today.';
+    }
     if (recent.length > 1) {
         return 'Yes, I am still with you. Please continue.';
     }
-    return 'Hello. How can we help you today.';
+    return 'Hi, how may we help you today.';
 }
 
 async function callGemini(systemPrompt, recent) {
@@ -280,7 +303,7 @@ async function callGemini(systemPrompt, recent) {
     for (const model of GEMINI_MODELS) {
         try {
             const res = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/\( {model}:generateContent?key= \){GEMINI_API_KEY}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -347,29 +370,36 @@ async function callNvidia(systemPrompt, recent) {
 async function generateAIResponse(phone, userMessage, isAdLead = false) {
     const recent = buildRecentHistory(phone, userMessage);
     const memoryBlock = buildMemoryBlock(phone);
+    const timeContext = getZambiaTimeContext();
 
-    const systemPrompt = `You are a professional human representative of Sovet Link Technologies in Zambia.
-Keep replies short: 1 or 2 sentences only.
+    const systemPrompt = `You are a professional, friendly human representative of Sovet Link Technologies in Zambia, on WhatsApp. All prices are in Zambian Kwacha (K).
+
+${timeContext}
 
 ${memoryBlock}
+Use the recent conversation and the memory above. Do not restart the chat or greet again if it is already underway. If the customer already said what they want, continue from that instead of asking again.
 
-Use the recent conversation. Do not restart the chat.
-If the customer already said they want Starlink Gen 3, continue from that. Do not say hello again.
+TONE:
+- Keep replies SHORT: one short sentence is ideal, two only if truly necessary. Never chain multiple facts into one long sentence, split them into short back-to-back sentences instead.
+- Answer only what was asked. Do not over-explain or volunteer extra prices, details, or options the customer did not ask about. Reveal information only when asked for it.
+- Talk like a real person quickly typing on a phone, not a brochure.
+- If a customer simply says "hi" or "hello" with no prior context, do not instantly start selling. Ask how you can help first, unless this is an ad lead (see below).
 
 STRICT RULES:
 - Never use emojis or exclamation marks.
-- Never invent prices, links, or past conversations.
+- Never invent prices, links, physical addresses, team hours, or past conversations.
 - If the customer refers to a previous discussion that is NOT in memory and NOT in recent messages, reply exactly:
   "Let me connect you with the team so they can assist you properly."
 - Before giving installation price you must know the city.
 - Pricing:
-  Lusaka / Eastern: K1,500 service + K2,000 mount if needed
-  Kitwe / Copperbelt: K2,000 installation
-  Other areas: special arrangement needed
-- Packages: Gen 3 Kit K8,500 | Mini K6,500 | Mount K2,000 | Monthly K800
-- Payment: Airtel Money or bank transfer only.
-${OWNER_DIRECT_LINE ? `- If handing over, they can also call ${OWNER_DIRECT_LINE}.` : ''}
-${isAdLead ? 'This is an ad lead. Briefly introduce the Starlink options.' : ''}`;
+  Lusaka / Eastern Province: K1,500 service charge + K2,000 installation fee
+  Kitwe: K2,000 installation fee, no service charge
+  Elsewhere in Zambia: offer both options — self-install with our remote guidance, or professional installation which we can arrange for their area (transport and logistics fees apply, management prepares a custom quote)
+- Do not repeat a price or fact you already gave earlier in this conversation unless asked again. Refer back naturally instead (e.g. "that price", "the Gen 3").
+- Packages: Gen 3 Kit K8,500 | Mini K6,500 | Original Mount K2,000 | Monthly K800. The mount and the installation fee are separate charges even though both can be K2,000.
+- Payment: Airtel Money or bank transfer only. Never mention a payment link.
+${OWNER_DIRECT_LINE ? `- If you cannot answer something confidently, apologize and give them this number to call: ${OWNER_DIRECT_LINE}.` : '- If you cannot answer something confidently, apologize and let them know a team member will follow up.'}
+${isAdLead ? '- This message is from an ad click. Briefly introduce the Starlink options right away.' : ''}`;
 
     const geminiReply = await callGemini(systemPrompt, recent);
     if (geminiReply) return geminiReply;
@@ -401,18 +431,25 @@ async function startBot() {
     currentSock = sock;
     sock.ev.on('creds.update', saveCreds);
 
+    // Pulls in conversations that happened before this device was linked, so a customer who
+    // talked to the business a week ago doesn't get treated as a stranger once the AI connects.
+    // Messages are sorted oldest-to-newest first: WhatsApp does not guarantee delivery order for
+    // this event, and pushing them in the wrong order would store the history backwards.
     sock.ev.on('messaging-history.set', ({ messages }) => {
         if (!messages || !messages.length) return;
         console.log(`History sync received: ${messages.length} messages`);
 
+        const sorted = [...messages].sort((a, b) => {
+            const ta = Number(a.messageTimestamp) || 0;
+            const tb = Number(b.messageTimestamp) || 0;
+            return ta - tb;
+        });
+
         let stored = 0;
-        for (const msg of messages) {
+        for (const msg of sorted) {
             try {
                 const phone = getPhoneFromMessage(msg);
                 if (!phone) continue;
-
-                const customer = getOrCreateCustomer(phone);
-                if (customer.history.length >= MAX_HISTORY) continue;
 
                 const text = msg.message?.conversation ||
                              msg.message?.extendedTextMessage?.text ||
@@ -534,15 +571,17 @@ async function startBot() {
         }
 
         if (lower.includes('can i get more info on this')) {
+            const delay = Math.min(Math.max(AD_LEAD_GREETING.length * 20, 1500), 4000);
             await sock.sendPresenceUpdate('composing', sender);
-            await new Promise(r => setTimeout(r, 1800));
+            await new Promise(r => setTimeout(r, delay));
+            await sock.sendPresenceUpdate('paused', sender);
             await sendTrackedMessage(sock, sender, { text: AD_LEAD_GREETING });
             addToHistory(phone, 'assistant', AD_LEAD_GREETING, false);
             saveState();
             return;
         }
 
-console.log(`From ${phone}: ${text}`);
+        console.log(`From ${phone}: ${text}`);
         await sock.sendPresenceUpdate('composing', sender);
 
         const raw = await generateAIResponse(phone, text, isAdLead);
@@ -555,7 +594,8 @@ console.log(`From ${phone}: ${text}`);
         addToHistory(phone, 'assistant', reply, false);
         saveState();
 
-        await new Promise(r => setTimeout(r, Math.min(Math.max(reply.length * 18, 1200), 3200)));
+        const delay = Math.min(Math.max(reply.length * 20, 1500), 4000);
+        await new Promise(r => setTimeout(r, delay));
         await sock.sendPresenceUpdate('paused', sender);
         await sendTrackedMessage(sock, sender, { text: reply });
     });
